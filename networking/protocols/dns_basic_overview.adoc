@@ -1,0 +1,902 @@
+= Comprendre le système DNS
+:icons: font
+:source-highlighter: highlightjs
+:toc: left
+
+== Domaines et hiérarchies des domaines
+
+.www.example.com
+[.text-center]
+[plantuml, namespace-structure, png]
+----
+left to right direction
+rectangle "Root" as root
+rectangle "TLD (.com)" as tld
+rectangle "Second Level (.example)" as second
+rectangle "Third Level (www)" as third
+rectangle "..." as next
+
+root --> tld
+tld --> second
+second --> third
+third --> next
+----
+
+[NOTE]
+====
+La résolution se lit de droite à gauche et le premier dernier point (tout à droite) est appelé domaine racine
+.com est appelé TLD ou Top Level Domain., on trouve ensuite le second level etc..
+On peut lire en quelques sortes l'adresse par ".www .example .com ."
+====
+
+[NOTE]
+====
+🔹 La combinaison du **TLD + Second Level** est appelée **Zone Apex** ou *Naked Domain* : `example.com`
+
+🔹 Elle correspond généralement au domaine enregistré chez un registrar.
+====
+
+[NOTE]
+====
+🌐 La totalité est appelée le **FQDN (Fully Qualified Domain Name)** : `www.example.com.`
+
+🧩 Ce nom inclut **tous les niveaux** jusqu’à la racine `.`
+====
+
+[NOTE]
+====
+🌐 La composition de 1 à x domaines créé une zone
+====
+
+== Zones DNS
+
+=== Comprendre la notion de Zone DNS
+
+Une **zone DNS** est une **clé** utilisée dans un serveur **autoritaire** (qui devient autoritaire pour cette zone plus précisément, nous y viendrons) pour enregistrer et retrouver un ensemble d’enregistrements DNS (`A`, `AAAA`, `MX`, `TXT`, `CNAME`, etc.) (Nous viendrons également à ces enregistrements).
+
+La structure du DNS repose entièrement sur cette logique de **clés hiérarchiques**.
+Chaque requête DNS consiste à **naviguer de zone en zone**, c’est-à-dire **de clé en clé**, en suivant les **enregistrements `NS`** jusqu’à atteindre la zone finale autoritaire.
+
+Cette "clé" correspond à un **nom de domaine**, généralement une **composition d’un TLD + un ou plusieurs niveaux suivants**, par exemple :
+– `example.com`
+– `sub.dept.univ.edu`
+
+Elle agit comme un **point d’ancrage** dans le serveur : tous les enregistrements associés à cette zone sont gérés localement, **tant qu’aucune délégation `NS` n’est faite**. On appelle délégation NS la présence d'un enregistrement NS pour une "sous zone" de cette zone. Il faut comprendre: "Pour la sous zone xxx va voir nameserver (NS), il est possible qu'il contiennent les enregistrements, ou il saura te rediriger"
+
+=== Enregistrements DNS (Zone File)
+
+Une **zone DNS** ne se limite pas à un simple nom : elle est associée à un **fichier de zone** (zone file), qui **définit tous les enregistrements DNS** que le serveur doit connaître pour cette zone.
+
+Chaque **clé** (nom de domaine) correspond à une **entrée** dans ce fichier, qui spécifie :
+
+* Son **type d’enregistrement** (`A`, `AAAA`, `MX`, `NS`, `SOA`, etc.)
+* Sa **valeur** (adresse IP, serveur de mail, alias, etc.)
+* Une **durée de vie (TTL)** – Time To Live – indiquant combien de temps l’information peut être mise en cache.
+
+Ce fichier est la **spécification complète de la zone**. Le serveur autoritaire l’utilise pour répondre aux requêtes sur les noms contenus dans cette zone.
+
+==== Extrait simplifié d’un fichier de zone `example.com`
+
+[source,dns]
+----
+$TTL 3600
+@       IN SOA  ns1.example.com. admin.example.com. ( ... )
+        IN NS   ns1.example.com.
+        IN NS   ns2.example.com.
+@       IN A    192.0.2.1
+www     IN A    192.0.2.2
+mail    IN MX   10 mail.example.com.
+----
+
+Chaque ligne représente un **enregistrement DNS** associé à la zone `example.com`.
+
+Nous allons maintenant détailler les principaux types d’enregistrements que l’on peut trouver dans une zone DNS.
+
+== Types d’enregistrements DNS
+
+Chaque **enregistrement DNS** indique une information précise pour un nom de domaine donné.
+
+Voici les principaux types d’enregistrements, organisés par usage :
+
+=== 🔹 Enregistrements de résolution (vers une adresse IP)
+
+[cols="1,3", options="header"]
+| Type | Description
+| A    | Associe un nom de domaine à une adresse IPv4 (ex: `192.0.2.1`)
+| AAAA | Associe un nom de domaine à une adresse IPv6 (ex: `2001:db8::1`)
+| CNAME | Déclare un alias : ce nom pointe vers un **autre nom de domaine**
+➡️ Utilisé pour rediriger un nom vers un autre (ex : `blog.example.com` vers `example.com`)
+| DNAME | Comme CNAME mais pour **tous les sous-domaines**
+➡️ Ex : tous les `*.legacy.example.com` pointent vers `*.newdomain.com`
+
+=== 🔹 Enregistrements de messagerie
+
+[cols="1,3", options="header"]
+| Type | Description
+| MX   | Spécifie le serveur de mail (Mail eXchanger) pour un domaine
+➡️ Peut contenir une **priorité** : plus elle est basse, plus le serveur est préféré
+| SPF  | Ancien format d’authentification des mails (déprécié, remplacé par TXT)
+| TXT  | Texte libre — utilisé notamment pour :
+→ Vérification de domaine (Google, Office 365…) (Voir présentation technique)
+→ SPF moderne (protection anti-spam) (Voir présentation technique)
+→ DKIM, DMARC (authentification des mails) (Voir présentation technique)
+
+=== 🔹 Enregistrements de délégation
+
+[cols="1,3", options="header"]
+| Type | Description
+| NS   | Indique le ou les serveurs faisant autorité pour une **zone donnée**
+➡️ Clé essentielle pour la **délégation DNS**
+| SOA  | Start of Authority : en-tête obligatoire d’une zone
+→ Donne des métadonnées sur la zone :
+– Le serveur maître
+– L’adresse email de l’administrateur
+– Le numéro de version (serial)
+– Les paramètres de rafraîchissement / TTL
+
+=== 🔹 Enregistrements de sécurité
+
+Voir section technique pour plus de précisions
+
+[cols="1,3", options="header"]
+| Type | Description
+| DNSKEY | Contient une clé publique utilisée pour **signer les enregistrements DNS** (dans le cadre de DNSSEC)
+| RRSIG  | Signature cryptographique d’un enregistrement DNS (utilisé avec DNSKEY)
+| DS     | Delegation Signer : permet de **valider la délégation sécurisée** vers une sous-zone
+| NSEC / NSEC3 | Prouvent qu’un enregistrement **n’existe pas** (DNSSEC)
+| CDS / CDNSKEY | Versions « enfant » des enregistrements DS / DNSKEY (utilisés pour la mise à jour des clés via les enfants)
+
+==== 🔹 Enregistrements spécifiques ou peu courants
+
+[cols="1,3", options="header"]
+| Type | Description
+| PTR   | Pointeur utilisé pour la résolution **inverse** (IP → nom de domaine)
+➡️ Exemple : `1.2.0.192.in-addr.arpa → example.com`
+| SRV   | Indique un **service réseau** disponible pour un domaine (port, protocole, priorité…)
+➡️ Exemple : `_sip._tcp.example.com`
+| CAA   | Indique quelles **autorités de certification** sont autorisées à émettre des certificats pour le domaine
+| HINFO | Fournit des informations sur le **matériel** et le **système d’exploitation**
+| AFSDB | Utilisé avec le système de fichiers distribué AFS (rare)
+| RP    | Indique une **adresse e-mail de contact** pour un domaine
+| LOC   | Donne une position géographique (latitude/longitude) d’un hôte
+| NAPTR | Utilisé pour la réécriture de noms, notamment dans VoIP ou ENUM
+| SSHFP | Contient l’empreinte de clé SSH d’un serveur — pour vérification sans `known_hosts`
+
+[NOTE]
+====
+📌 Chaque enregistrement est défini **pour un nom de domaine** donné, dans une **zone DNS** spécifique.
+➡️ Si la zone est `example.com`, on pourra avoir des enregistrements comme :
+
+- `www.example.com. IN A 192.0.2.1`
+- `mail.example.com. IN MX 10 mailserver.example.com.`
+- `example.com. IN SOA ...`
+====
+
+[NOTE]
+====
+Le champ IN dans les enregistrements DNS signifie "Internet". C'est une abbréviation de class IN. Il indique la classe du protocole. Historique il y avait CH pour chaos, ou HS pour Hesiod, mais ces deux protocoles classes ne sont plus uitlisées.
+====
+
+[NOTE]
+====
+On peut lire les enregistrements de la manière suivante :
+
+- `www.example.com. IN A 192.0.2.1` => `www.example.com. dispose d'un enregistrement INternet de type A, sa valeur est 192.0.2.1`
+- `mail.example.com. IN MX 10 mailserver.example.com.` => `mail.example.com. dispose d'un enregistrement INternet de type MX, de priorité 10, sa valeur est mailserver.example.com.`
+====
+
+== Architecture de la résolution DNS
+
+=== Résolution DNS : itérative vs récursive
+
+Il existe deux modes de résolution DNS, définis par le **flag `RD` (Recursion Desired)** dans l’en-tête DNS de la requête :
+
+* `RD = 1` → le client demande une **résolution récursive complète**
+* `RD = 0` → le client demande une **résolution itérative**
+
+==== 🔁 Résolution récursive (mode courant)
+
+- Le client délègue la résolution complète au **résolveur DNS** (ex : `1.1.1.1`, `8.8.8.8`)
+- Le résolveur interroge successivement les serveurs racine, TLD, puis autoritaires
+- Il renvoie directement la **réponse finale (IP)** au client
+- C’est le mode utilisé dans **la majorité des cas** (navigateurs, OS, etc.)
+
+==== 🔂 Résolution itérative (mode avancé)
+
+- Le client interroge lui-même les serveurs DNS **étape par étape**
+- Chaque serveur répond avec une **référence (`NS`) vers la zone suivante**
+- Le client continue jusqu'à obtenir la réponse finale
+
+==== 🧠 Qui utilise quoi ?
+
+[cols="2*", options="header"]
+| Cas d'usage                       | Type de résolution
+| Navigateur ou OS grand public    | Récursive (`RD=1`)
+| Résolveur DNS interrogeant la racine | Itérative (`RD=0`)
+| Serveurs racine / TLD            | Ne font **jamais** de récursif ; répondent **en itératif uniquement**
+
+==== 📦 Réponse du serveur
+
+Dans la réponse DNS, le serveur peut indiquer s’il **accepte ou non la récursion** :
+
+* `RA = 1` → Recursion Available (le serveur sait faire du récursif)
+* `RA = 0` → Ce serveur ne gère **que de l’itératif**
+
+[NOTE]
+====
+📌 Le **mode de résolution** est défini par le client (`RD=1` ou `RD=0`)
+📌 Les **serveurs racine, TLD et autoritaires** ne font **jamais** de récursif, même si `RD=1` est activé
+📌 Seuls les **résolveurs DNS** comme `1.1.1.1` ou `8.8.8.8` exécutent une vraie résolution récursive
+====
+
+== Processus de résolution macro
+
+=== Étape 1 : Résolution locale (cache DNS ou /etc/hosts)
+
+[.text-center]
+[plantuml, dns-local-resolution, png]
+----
+actor "Client" as C
+database "/etc/hosts\n+ cache DNS local" as Local
+
+C --> Local : Résolution www.example.com
+Local --> C : Réponse (si trouvée)
+----
+
+=== Étape 2 : Résolution par le résolveur récursif (résolution complète)
+
+[.text-center]
+[plantuml, dns-resolution-deep, png]
+----
+actor "Client" as C
+node "Résolveur DNS Récursif (ex: 1.1.1.1)" as R
+node "Root Server" as RS
+node "TLD Server (.com)" as TLD
+node "Authoritative NS (example.com)" as A
+
+C --> R : Requête www.example.com
+R --> RS : "Où est le TLD .com ?"
+RS --> R : "Va voir TLD Server"
+R --> TLD : "Où est example.com ?"
+TLD --> R : "Va voir le serveur A"
+R --> A : "Quelle est l’IP de www ?"
+A --> R : "93.184.216.34"
+R --> C : Réponse finale
+----
+
+[NOTE]
+====
+🧭 **Étapes internes d’un résolveur récursif (ex : 1.1.1.1)**
+
+1. 🔍 Il commence par vérifier son **cache DNS interne** : si la réponse existe déjà et que le ttl n'est pas expiré, il la renvoie directement.
+2. 🌐 Si la réponse n’est pas en cache, il démarre une **résolution complète**, de la racine jusqu’au serveur autoritaire.
+- Il s’appuie sur un fichier `roothints` : une **liste des adresses IP des 13 serveurs racine** (`a.root-servers.net`, etc.)
+- Il interroge un serveur racine pour connaître les `NS` du TLD concerné (ex : `.com`)
+- Puis il interroge les **serveurs du TLD** (`.com`) pour obtenir les `NS` de `example.com`
+- Enfin, il interroge le **serveur autoritaire pour `example.com`** pour obtenir l’IP de `www`
+
+📌 À chaque étape, les serveurs DNS répondent avec des **enregistrements de délégation (`NS`)**
+Le résolveur suit cette **chaîne hiérarchique**, étape par étape, **jusqu’à trouver la réponse finale**.
+====
+
+==== 🔹 Exemple 1 – Une seule zone (`example.com`)
+
+Tous les enregistrements sont gérés dans la même zone, sans délégation :
+
+[source,dns]
+----
+; Zone : example.com
+example.com.          IN A     192.0.2.1
+www.example.com.      IN A     192.0.2.2
+mail.example.com.     IN MX    10 mail.example.com.
+----
+
+Ici, les sous-domaines `www`, `mail`, etc. sont **inclus dans la zone `example.com`**, gérée par un **serveur autoritaire unique**.
+
+==== 🔹 Exemple 2 – Délégation vers une autre zone (`blog.example.com`)
+
+La zone `example.com` délègue `blog.example.com` à d'autres serveurs via un enregistrement `NS` :
+
+[source,dns]
+----
+; Dans la zone parent : example.com
+blog.example.com.     IN NS    ns1.blog.example.com.
+                      IN NS    ns2.blog.example.com.
+
+; Zone séparée : blog.example.com
+@                     IN SOA   ns1.blog.example.com. admin.blog.example.com. (...)
+                      IN NS    ns1.blog.example.com.
+                      IN NS    ns2.blog.example.com.
+@                     IN A     203.0.113.42
+----
+
+Résultat :
+* `blog.example.com` devient une **zone DNS indépendante**
+* Elle est servie par ses propres serveurs (`ns1.blog.example.com`, etc.)
+* La zone `example.com` **ne connaît pas** les enregistrements internes de `blog.`, uniquement qu’elle l’a déléguée
+
+Une **zone DNS** est un segment de l’espace de noms DNS associé à un **nom de domaine**, pour lequel un serveur détient et publie des **enregistrements DNS officiels**. Nous y reviendrons mais c'est la présence d'un enregistrement SOA qui fait qu'un serveu est bien l'authoritative serveur pour une zone.
+
+[NOTE]
+====
+Une **zone DNS** peut contenir :
+
+1. Des **enregistrements finaux** (`A`, `AAAA`, `MX`, `TXT`, `CNAME`, etc.)
+2. Des **délégations** vers d'autres zones (via des enregistrements `NS`)
+3. ✅ Ou **les deux à la fois**
+
+Exemple : la zone `example.com` peut contenir les enregistrements pour `www.example.com` et déléguer `blog.example.com` à une autre zone.
+====
+
+Par défaut, tous les sous-domaines sont inclus dans la zone, **tant qu’ils n’ont pas été explicitement délégués**.
+
+== Processus de résolution détaillé
+
+=== Étape 1 : Interrogation d’un serveur racine (zone ".")
+
+==== 🔹 Requête DNS
+
+QNAME = fr.blog.example.com.
+QTYPE = A
+
+==== 🔹 Réponse DNS (troncature simplifiée)
+
+Authority Section:
+com. IN NS a.gtld-servers.net.
+com. IN NS b.gtld-servers.net.
+...
+
+Additional Section:
+a.gtld-servers.net. IN A 192.5.6.30
+b.gtld-servers.net. IN A 192.33.14.30
+
+==== 🔹 Zone racine : fichier conceptuel db.root
+
+__le @ signifie toujours le nom de la zone, donc ici .__
+
+Le fichier de zone racine contient les délégations vers les TLD (Top-Level Domains) comme .com, .fr, .org, etc. Exemple :
+
+$TTL 3600000
+@ IN SOA a.root-servers.net. hostmaster.root-servers.org. (
+2025062701 ; Serial
+1800       ; Refresh
+900        ; Retry
+604800     ; Expire
+86400 )    ; Minimum TTL
+
+@ IN NS a.root-servers.net.
+@ IN NS b.root-servers.net.
+@ IN NS c.root-servers.net.
+...
+
+com. IN NS a.gtld-servers.net.
+fr.  IN NS f.nic.fr.
+
+; Glue records pour les serveurs de TLD
+a.gtld-servers.net. IN A 192.5.6.30
+f.nic.fr.            IN A 192.134.0.49
+
+📌 Ce fichier de zone est maintenu par l'IANA. Il ne contient aucune information sur les domaines de second niveau (ex: example.com).
+
+📌 Les résolveurs n'interrogent pas la racine via ce fichier, mais via une liste appelée roothints qui contient les IP des serveurs racine (A à M).
+
+=== Étape 2 : Interrogation du TLD .com
+
+==== 🔹 Requête DNS
+
+QNAME = fr.blog.example.com.
+QTYPE = A
+
+==== 🔹 Réponse DNS
+
+Authority Section:
+blog.example.com. IN NS ns1.blog.example.com.
+blog.example.com. IN NS ns2.blog.example.com.
+
+Additional Section:
+ns1.blog.example.com. IN A 203.0.113.10
+ns2.blog.example.com. IN A 203.0.113.11
+
+==== 🔹 Fichier de zone : db.com (extrait)
+
+$TTL 3600
+@ IN SOA a.gtld-servers.net. admin.gtld-servers.net. (
+2025062701 ; Serial
+3600       ; Refresh
+1800       ; Retry
+604800     ; Expire
+86400 )    ; Minimum TTL
+
+@ IN NS a.gtld-servers.net.
+@ IN NS b.gtld-servers.net.
+
+example.com. IN NS ns1.example.com.
+example.com. IN NS ns2.example.com.
+ns1.example.com. IN A 203.0.113.1
+ns2.example.com. IN A 203.0.113.2
+
+blog.example.com. IN NS ns1.blog.example.com.
+blog.example.com. IN NS ns2.blog.example.com.
+ns1.blog.example.com. IN A 203.0.113.10
+ns2.blog.example.com. IN A 203.0.113.11
+
+[NOTE]
+====
+📌 Bien que blog.example.com semble sémantiquement dépendre de example.com, dans cet exemple, il est directement délégué au niveau de .com, au même titre que example.com.
+
+📌 En conséquence, la zone example.com ne connaît rien de l’existence ou du contenu de blog.example.com. Elle n’en est pas responsable, et ne pourra pas répondre à une requête concernant blog.example.com.
+
+📌 Cela est conforme au modèle DNS : n’importe quelle sous-zone peut être déléguée indépendamment à n’importe quel niveau, tant que la délégation est déclarée dans la zone parente.
+====
+
+=== Étape 3 : Interrogation de blog.example.com
+
+==== 🔹 Requête DNS
+
+QNAME = fr.blog.example.com.
+QTYPE = A
+
+==== 🔹 Réponse DNS
+
+Authority Section:
+fr.blog.example.com. IN NS ns1.fr.blog.example.com.
+fr.blog.example.com. IN NS ns2.fr.blog.example.com.
+
+Additional Section:
+ns1.fr.blog.example.com. IN A 198.51.100.42
+ns2.fr.blog.example.com. IN A 198.51.100.43
+
+==== 🔹 Fichier de zone db.blog.example.com
+
+$TTL 3600
+@ IN SOA ns1.blog.example.com. admin.blog.example.com. (
+2025062601 ; Serial
+3600       ; Refresh
+1800       ; Retry
+604800     ; Expire
+86400 )    ; Minimum TTL
+
+@ IN NS ns1.blog.example.com.
+@ IN NS ns2.blog.example.com.
+
+fr IN NS ns1.fr.blog.example.com.
+fr IN NS ns2.fr.blog.example.com.
+ns1.fr.blog.example.com. IN A 198.51.100.42
+ns2.fr.blog.example.com. IN A 198.51.100.43
+
+=== Étape 4 : Interrogation du serveur final ns1.fr.blog.example.com
+
+==== 🔹 Requête DNS
+
+QNAME = fr.blog.example.com.
+QTYPE = A
+
+==== 🔹 Réponse DNS
+
+Answer Section:
+fr.blog.example.com. IN A 192.0.2.99
+
+==== 🔹 Fichier de zone db.fr.blog.example.com
+
+$TTL 3600
+@ IN SOA ns1.fr.blog.example.com. admin.fr.blog.example.com. (
+2025062601 ; Serial
+3600       ; Refresh
+1800       ; Retry
+604800     ; Expire
+86400 )    ; Minimum TTL
+
+@ IN NS ns1.fr.blog.example.com.
+@ IN NS ns2.fr.blog.example.com.
+
+@ IN A 192.0.2.99
+
+=== 🔚 Résolution complète
+
+Le serveur récursif retourne l’IP 192.0.2.99 au client. Mission accomplie 🎯.
+
+Chaque serveur n’a répondu que pour sa propre zone et a fourni les délégations nécessaires (enregistrements NS + glue A).
+
+== Rôle et structure du domaine racine (Root Domain)
+
+=== 🔹 Fonction principale
+
+* Le domaine racine (.) constitue le point d’entrée officiel de l’espace de noms DNS.
+* Le serveur racine oriente la requête DNS vers le bon serveur TLD (.com, .fr, etc.) (Il contient donc toutes les zones TLD)
+* Il ne fournit pas de réponse finale, mais transfère la résolution à la zone suivante (TLD zone)
+* Il est interrogé uniquement par les résolveurs récursifs (ex : 1.1.1.1, 8.8.8.8) lorsqu’aucune information pertinente n’est encore en cache
+
+=== 🔹 Nombre et structure
+
+* La zone racine est servie par une infrastructure mondiale de serveurs dits “racine”, à la base de toute résolution hiérarchique.
+* Il existe 13 serveurs racine référencés officiellement, nommés de A à M
+* En réalité, ils sont une réplique d'un seul et unique serveur racine maitre, dit autoritaire pour la zone racine. Ce serveur est maintenu par l'IANA (ICANN).
+* Ils sont gérés par différents organismes, coordonnés par l'ICANN
+
+Chacun de ces 13 "serveurs racine" sont en réalité massivement répliqués (plus de 1 600 instances globales)
+
+La réplication s’appuie sur la technologie anycast pour :
+Assurer résilience (en cas de panne locale)
+Offrir une faible latence (route vers l’instance la plus proche)
+
+=== 🔹 Raison du chiffre 13
+
+[NOTE]
+--
+🔢 Le chiffre 13 n’est pas arbitraire : il vient d’une contrainte technique historique.
+
+À l’origine, une réponse DNS devait tenir dans 512 octets maximum (limite UDP DNS sans EDNS0).
+
+➡️ La réponse du serveur racine devait contenir :
+– Les 13 enregistrements NS (A à M)
+– Les glue records (adresses IP associées, A pour IPv4 et AAAA pour IPv6)
+💡 Or, chaque serveur racine a un nom long (a.root-servers.net).
+Dans les années 80 on intérrogeait régulièrement le serveur maitre de la zone racine (ce qui n'est plus le cas aujourd'hui), donc sa réponse (liste des NS avec ips) devait tenir dans 512 octets.
+
+Cette contrainte dictait donc la taille maximale de la liste de serveurs racine.
+Depuis, cette limite a été levée via EDNS0, mais la structure reste pour des raisons de compatibilité.
+--
+
+=== 🔹 Contenu de la zone racine
+
+    La zone racine ne contient que :
+        Des enregistrements NS pour chaque TLD connu (.com, .fr, .org, etc.)
+        Leurs glue records (adresses IP nécessaires à la résolution)
+
+Elle ne contient aucune information applicative (ex : pas d’A ou MX pour example.com)
+
+== Top Level Domains (TLD)
+
+Les domaines de premier niveau (TLD) constituent la première division sous la racine dans la hiérarchie DNS.
+Ils se répartissent en **deux grandes catégories** :
+
+[cols="2*", options="header"]
+|===
+| gTLD (génériques)        | ccTLD (country codes)
+| `.com`, `.org`, `.net`   | `.fr`, `.de`, `.jp`
+| `.edu`, `.gov`, `.info`  | `.uk` (ex : `co.uk`)
+|===
+
+* Les **gTLD** sont à vocation générale, souvent liés à une activité (commerciale, gouvernementale…).
+* Les **ccTLD** sont liés à un pays ou un territoire, selon la norme [ISO 3166-1 alpha-2](https://fr.wikipedia.org/wiki/ISO_3166-1_alpha-2).
+* Pour consulter la liste complète des TLD gérés dans la racine DNS
+👉 https://www.iana.org/domains/root/db
+
+== DNS autoritaire ou Authoritative DNS
+
+Un **serveur DNS n’est pas “autoritaire” par nature** : il l’est **uniquement pour les zones qu’il héberge localement**.
+
+Autrement dit :
+– Un même serveur peut être **autoritaire pour plusieurs zones** (ex : `.com`, `example.com`, `blog.example.com`)
+– Et il peut **ne pas l’être du tout** pour d’autres zones qu’il ne connaît pas ou ne sert pas
+
+[IMPORTANT]
+====
+🔹 Un **serveur est dit autoritaire** pour une zone s’il :
+
+– Détient cette zone **en local** (fichier de zone, base de données, etc.)
+– Peut **répondre de manière définitive** à des requêtes sur cette zone
+– Ne réalise **aucune résolution récursive**
+
+🔹 Ce rôle est donc **relatif à une zone donnée** : un serveur peut être autoritaire pour `example.com` mais pas pour `google.com`.
+====
+
+La **structure hiérarchique des zones** et la **chaîne de délégation via les enregistrements `NS`** sont ce qui permet à l’ensemble du DNS de fonctionner comme un arbre distribué, chaque serveur n’étant responsable que des zones qui lui sont explicitement attribuées.
+
+== Mécanisme de cache DNS
+
+Chaque résolveur DNS (notamment les serveurs récursifs comme `1.1.1.1` ou `8.8.8.8`) met en place un **cache DNS**, pour améliorer drastiquement la rapidité des réponses et réduire le trafic réseau inutile. Ce cache est basé sur le TTL (Time To Live).
+
+=== 📦 Fonctionnement du TTL (Time To Live)
+
+Le champ TTL est une **durée en secondes** qui détermine **combien de temps une réponse DNS peut être conservée en cache**.
+
+=== 🔁 Mécanisme de calcul
+
+1. Lorsqu’un enregistrement DNS est reçu, il est accompagné d’un `TTL` (ex : `3600` secondes).
+2. Le résolveur récursif ou local le stocke en cache **avec un horodatage** (timestamp).
+3. À chaque nouvelle requête :
+- Il **calcule le temps écoulé** depuis la mise en cache.
+- Il **soustrait ce temps écoulé** du TTL initial pour obtenir le **TTL restant**.
+- Si le TTL restant > 0 → ✅ entrée encore valide, réponse depuis le cache.
+- Si le TTL ≤ 0 → ❌ entrée expirée, nouvelle résolution DNS complète.
+
+==== 💡 Remarques
+
+- Le TTL **n’est pas décrémenté en temps réel** dans le cache (pas de minuterie active).
+- Le serveur peut transmettre le **TTL restant** dans sa réponse pour éviter une surconservation côté client.
+
+=== 🔁 Cycle de vie d’une résolution avec cache
+
+[.text-center]
+[plantuml, dns-caching-full, png]
+----
+title "Cycle de vie du cache DNS (avec expiration TTL)"
+start
+:Requête DNS;
+if (Entrée en cache ?) then (Oui)
+  if (TTL expiré ?) then (Oui)
+    :Résolution complète;
+    :Stockage de la réponse\navec son TTL;
+  else (Non)
+    :Réponse immédiate;
+  endif
+else (Non)
+  :Résolution complète;
+  :Stockage de la réponse\navec son TTL;
+endif
+stop
+----
+
+==== 🔎 Détails importants
+
+* **Cache DNS** = mémoire temporaire des réponses (positives ou négatives)
+* **TTL (Time To Live)** : durée (en secondes) pendant laquelle une réponse peut être conservée
+- Définie dans le fichier de zone par l’administrateur de la zone
+* **Negative Caching** :
+- Même les échecs (nom inexistant) sont mis en cache pour une courte durée
+- Évite de répéter inutilement des résolutions vouées à échouer
+- Exemple d’entrée négative : NXDOMAIN
+
+==== 📦 Où le cache est-il utilisé ?
+
+[cols="2,4a", options="header"]
+| Niveau | Détails
+| Résolveur récursif (ex: 1.1.1.1)
+| Principal point de cache. Tous les serveurs comme Cloudflare, Google DNS, Quad9 conservent les réponses (A, AAAA, CNAME, etc.) selon le TTL spécifié. Ils sont optimisés pour cela.
+
+| OS local (Windows, Linux, macOS)
+| Certains systèmes conservent un **cache DNS local** (dans la RAM). Il peut être vidé ou interrogé.
+- **Windows** :
+ +
+[source,cmd]
+----
+ipconfig /displaydns  # Afficher le cache DNS
+ipconfig /flushdns    # Vider le cache DNS
+----
+- **Linux** :
+- Si un service comme `systemd-resolved` ou `nscd` est activé, ils gèrent ce cache.
+- Sinon, le système s’appuie uniquement sur le cache applicatif.
+- Exemples :
+ +
+[source,bash]
+----
+systemd-resolve --statistics
+sudo systemd-resolve --flush-caches
+nscd -g
+----
+
+| Navigateurs web
+| Les navigateurs comme Chrome, Firefox, Safari disposent **de leur propre cache DNS**, en plus de celui du système.
+- Exemple pour Chrome :
+ +
+[source]
+----
+chrome://net-internals/#dns
+----
+- Ce cache est isolé et peut parfois créer des incohérences (nom résolu dans Chrome mais pas dans un `curl` ou `dig`).
+
+==== 🧠 Pourquoi le cache est-il crucial ?
+
+* Réduction de la **latence** : moins de requêtes vers les serveurs racine, TLD, etc.
+* Amélioration des **performances perçues**
+* Allègement de la **charge réseau** (surtout pour les grands résolveurs publics)
+* Le TTL permet de contrôler **le temps de propagation des modifications DNS**
+- Exemple : baisser temporairement le TTL avant de changer l’IP d’un domaine
+
+==== 🛑 Attention
+
+Le cache peut provoquer des **effets de bord** :
+- Une entrée erronée peut persister plusieurs minutes/heures
+- Nécessité de forcer un vidage (`flush`) pour tester des mises à jour
+
+== Reverse Name Resolution
+
+La résolution DNS inverse consiste à retrouver un nom de domaine associé à une adresse IP. Elle repose sur l’utilisation d’un enregistrement PTR dans une zone spéciale : in-addr.arpa (IPv4) ou ip6.arpa (IPv6).
+
+=== 🔹 Transformation d'adresse
+
+Pour interroger le DNS à partir d’une adresse IP, on **inverse les octets** de l’adresse, puis on la suffixe avec `in-addr.arpa`.
+
+Exemple :
+
+----
+Adresse IP : 172.217.18.14
+→ Nom DNS : 14.18.217.172.in-addr.arpa.
+----
+
+Ce nom devient la **clé de requête DNS** (QNAME) utilisée pour effectuer une résolution de type `PTR`.
+
+=== 🔹 Exemple de requête DNS
+
+[source,dns]
+----
+QNAME = 14.18.217.172.in-addr.arpa.
+QTYPE = PTR
+----
+
+=== 🔹 Étapes de résolution (hiérarchique)
+
+La résolution suit le même modèle que la résolution directe, mais dans le domaine inversé `in-addr.arpa.` :
+
+. Le résolveur interroge la **racine DNS (`.`)** :
++
+[source,dns]
+----
+QNAME = 14.18.217.172.in-addr.arpa.
+→ Réponse : "NS pour arpa."
+----
+
+. Il interroge les **serveurs de la zone `arpa.`** :
++
+[source,dns]
+----
+→ Réponse : "NS pour in-addr.arpa."
+----
+
+. Puis les **serveurs de `in-addr.arpa.`** :
++
+[source,dns]
+----
+→ Réponse : "NS pour 172.in-addr.arpa."
+----
+
+. Et ainsi de suite jusqu’à trouver un serveur **autoritaire pour 217.172.in-addr.arpa** ou une zone plus spécifique :
++
+[source,dns]
+----
+→ Réponse : "NS pour 18.217.172.in-addr.arpa."
+----
+
+. Enfin, le serveur autoritaire pour cette zone retourne un enregistrement `PTR`.
+
+=== 🔹 Exemple de fichier de zone
+
+[source,dns]
+----
+$TTL 86400
+@ IN SOA ns1.revdns.example. admin.example.com. (
+    2025062701 ; Serial
+    3600       ; Refresh
+    1800       ; Retry
+    604800     ; Expire
+    86400 )    ; Minimum TTL
+
+@ IN NS ns1.revdns.example.
+
+14.18.217.172.in-addr.arpa. IN PTR host.example.com.
+----
+
+Cet enregistrement signifie que l'adresse IP `172.217.18.14` correspond au nom d’hôte `host.example.com.`.
+
+=== 🔹 Visualisation de la hiérarchie
+
+[plantuml, reverse-dns-hierarchy, png]
+----
+title "Hiérarchie de résolution DNS inverse (in-addr.arpa)"
+left to right direction
+rectangle "arpa" as arpa
+rectangle "in-addr" as inaddr
+rectangle "172" as o1
+rectangle "217" as o2
+rectangle "18" as o3
+rectangle "14" as o4
+
+arpa --> inaddr
+inaddr --> o1
+o1 --> o2
+o2 --> o3
+o3 --> o4
+----
+
+=== 🔹 Cas d’usage
+
+* Diagnostic et audit réseau (reverse DNS dans les logs)
+* Filtrage des emails (reverse DNS obligatoire pour éviter le spam)
+* Certains pare-feu et systèmes de sécurité
+
+=== 🔹 Outils de vérification
+
+* **Windows** : `ping -a 172.217.18.14`
+* **Linux** : `dig -x 172.217.18.14 +noall +answer`
+* **Web** : https://mxtoolbox.com/ReverseLookup.aspx
+
+=== 📝 Remarques
+
+* Tous les serveurs DNS **n’autorisent pas** ou **ne configurent pas** d’enregistrements PTR → la résolution inverse peut échouer sans erreur DNS.
+* La zone `in-addr.arpa.` est souvent **déléguée aux opérateurs réseau** (FAI, hébergeurs, etc.), qui seuls peuvent configurer les enregistrements PTR.
+
+== Enregistrement des noms de domaine
+
+=== Acteurs clés
+
+[.text-center]
+[plantuml, domain-registration, png]
+----
+title "Chaîne d'enregistrement d’un domaine"
+top to bottom direction
+[ICANN] --> [Registrars]
+[Registrars] --> [Resellers]
+[Resellers] --> [Registrants]
+----
+*Acteurs clés* :
+* **ICANN** : supervise la racine DNS, accrédite les registrars
+* **Registrars** (ex : Gandi, OVH, Amazon) : vendent les noms de domaine
+* **Resellers** : revendeurs s’appuyant sur l’API d’un registrar
+* **Registrants** : propriétaires finaux du domaine
+
+=== 🔹 Processus d’enregistrement
+
+. **Choix du TLD** (≈ 1 500 disponibles) — critères :
+* Support **DNSSEC**
+* Support **IDN** (caractères UTF-8 accentués)
+* Restrictions géographiques / légales (ex : `.ca`, `.bank`)
+. **Vérification de disponibilité** (WHOIS/RDAP ou portail du registrar)
+. **Protection anti-typosquatting**
+* *Typosquatting* : enregistrement de variantes typographiques malveillantes
+* **dnstwist** : outil CLI pour lister et surveiller les homographes. Jeter un coup d'oeil pour ne pas être lésé plus tard. (Outils python installable avec pip)
+. **Validation & paiement** : le registrar effectue la création via le protocole **EPP** (Extensible Provisioning Protocol).
+
+=== 🔹 Codes EPP (statuts de domaine)
+
+|===
+| Code | Effet & explication
+|------|---------------------
+| `clientHold` | **Suspend** l’activation : le domaine ne se résout plus tant que le registrant ne lève pas le statut.
+| `serverHold` | Suspension imposée par le **registre** (litige, non-paiement, décision judiciaire).
+| `clientTransferProhibited` | Blocage volontaire des **transferts sortants** — protection contre le vol de domaine.
+| `serverTransferProhibited` | Blocage de transfert imposé par le registre (procédure UDRP, etc.).
+|===
+
+*Vérification en ligne* : https://lookup.icann.org/
+
+=== Stockage des données DNS : zones & enregistrements
+
+[.text-center]
+[plantuml, dns-record-structure, png]
+----
+title "Structure interne d’un Resource Record"
+frame "Resource Record" {
+component "Name (étiquette)" as N
+component "Type (A, MX, NS…)" as Ty
+component "Class (IN)" as Cl
+component "TTL (durée de cache)" as T
+component "RDLENGTH (taille)" as L
+component "RDATA (données)" as D
+}
+----
+
+*Légende* :
+
+* **Name** : domaine ou `@` pour la racine de la zone
+* **Type** : nature du record (`A`, `AAAA`, `MX`, `PTR`, `SOA`, etc.)
+* **Class** : presque toujours `IN` (*Internet*)
+* **TTL** : durée (en s) avant expiration du cache
+* **RDLENGTH / RDATA** : taille et contenu effectif (IP, nom, clé, texte…)
+
+==== 🔹 Types de zones
+
+| Type de zone | Finalité | Exemple concret |
+|--------------|----------|-----------------|
+| **Forward**  | Nom → IP (résolution classique) | `www.example.com` ➜ `192.0.2.1` |
+| **Reverse**  | IP → Nom (`in-addr.arpa`, `ip6.arpa`) | `192.0.2.1` ➜ `host.example.com` |
+| **Secondary / Slave** | Copie complète d’une zone, mise à jour par `AXFR/IXFR` | Haute dispo chez plusieurs NS |
+| **Stub**     | Contient **uniquement** les enregistrements `NS` d’une zone distante | Optimise les requêtes internes |
+
+==== 🔹 Enregistrement SOA (Start of Authority)
+
+[source,dns]
+----
+example.com. 3600 IN SOA ns1.example.com. admin.example.com. (
+  2023062501 ; Serial (version de zone)
+  86400      ; Refresh (toutes les 24 h)
+  7200       ; Retry   (toutes les 2 h en cas d’échec)
+  3600000    ; Expire  (40 j avant abandon)
+  172800     ; NX TTL  (cache négatif 48 h)
+)
+----
+
+* **Serial** : doit être incrémenté à chaque modification de zone.
+* **Refresh/Retry/Expire** : rythment la synchronisation avec les serveurs secondaires.
+* **NX TTL** : temps de cache des réponses **NXDOMAIN**.
+
