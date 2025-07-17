@@ -1,0 +1,464 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+
+= Authentification SAML 2.0
+
+== 🧭 Vue macro du flux SAML SP-initié
+
+L'authentification SAML se base sur un échange de messages entre un Service Provider (SP) et un Identity Provider (IdP), structuré comme un aller-retour HTTP.
+
+Chaque entité publie un fichier `metadata.xml` :
+
+- Le `metadata.xml` du **IdP** est fourni au **SP** pour :
+- identifier l’`EntityID` de l’IdP
+- connaître le point d’entrée SSO (`SingleSignOnService`)
+- vérifier les signatures des `SAMLResponse`
+
+- Le `metadata.xml` du **SP** est fourni au **IdP** pour :
+- connaître les URLs autorisées (`AssertionConsumerService`)
+- vérifier les signatures des `SAMLRequest`
+- chiffrer des assertions avec la clé publique du SP si nécessaire
+
+Le flux ici décrit correspond au binding HTTP-Redirect (GET) initié par le SP.
+
+=== Étape 1 : Requête SAML (GET avec SAMLRequest en base64)
+
+Le client tente d'accéder à une ressource protégée sur le SP. Le SP le redirige vers l'IdP avec une requête `SAMLRequest`.
+
+Ce `SAMLRequest` est :
+
+- compressé (`deflate`)
+- encodé en base64
+- transmis en tant que paramètre d’URL
+
+[source]
+----
+GET https://idp.example.com/sso?SAMLRequest=...&RelayState=...&SigAlg=...&Signature=...
+----
+
+La SAMLRequest contient **deux informations critiques** :
+
+1. `Issuer` : identifie le SP (`EntityID`)
+2. `AssertionConsumerServiceURL` : indique à l’IdP où renvoyer la réponse
+
+Ces deux informations suffisent en théorie à garantir la sécurité. L'IdP peut vérifier l'identité du SP avec l'issuer et l'url de redirection demandé avec l'AssertionConsumerServiceURL. Mais dans les faits, on protège souvent le flux d'authentification de signatures supplémentaires:
+
+* Une signature des paramètres de l'URL: SAMRequest=...&RelayState=... signée à l'aide de la clé privée du SP, décryptée à l'aide de la clé publique contenue dans le metadata.xml fourni par le SP à l'IdP.
+* Un chiffrement de tout ou partie de la SAMLRequest à l'intérieur de celle-ci, à l'aide de la clé publique contenue dans le metadata.xml fourni par l'IdP au SP.
+
+La signature permets de vérifier que l'url n'a pas été modifié depuis le détenteur de la clé privée, donc le SP.
+
+Le chiffrement permets de chiffrer les informations détenus dans la SAMLRequest, seul l'IdP pourra alors décrypter à l'aide de sa clé privée.
+
+[NOTE]
+--
+🔁 En réalité, on ne chiffre quasiment jamais la SAMLRequest, et quand c’est le cas, c’est le SP qui chiffre une partie à destination de l’IdP avec la clé publique de l’IdP.
+
+Mais dans le flux standard Redirect (GET), la SAMLRequest est signée, pas chiffrée. C’est la SAMLResponse, ou plus précisément l’Assertion, qui peut être chiffrée, avec la clé publique du SP.
+--
+
+== 🔐 Mécanisme de sécurité côté IdP
+
+À ce stade, l’utilisateur **n’est pas encore authentifié**. L’IdP va :
+
+- Lire la `SAMLRequest`
+- Identifier l'`Issuer`
+- Valider que le `AssertionConsumerServiceURL` correspond bien à une valeur **connue et enregistrée** pour ce `Issuer`
+
+C’est **l’unique rempart contre les `SAMLRequest` forgées** quand elles ne sont **pas signées**.
+
+(En réalité, cette validation (Issuer + AssertionConsumerServiceURL) est vulnérable aux attaques de rejeu si aucun autre mécanisme (ex: ID unique + timestamp) n'est implémenté.)
+
+Quand l'url est signé, il va utiliser la clé publique détenue par le metadata.xml fournie par le SP pour vérifier l'authenticité des paramètres d'url
+
+Quand la SAMLRequest est chiffrée, il va utiliser sa clé privée pour la décrypter.
+
+== Etape 2 - SAMLResponse
+
+L'IdP génère un ou plusieurs assertions et signe cette réponse à l'aide de sa clé privée. En pratique la réponse contient souvent une assertion, mais il est tout à fait possible qu'une assertion contienne l'identité de l'utilisateur et une autre contienne les droits d'accès par ex (XACML, etc), une assertion peut aussi contenir une preuve d'authentification ou des extensions personnalisées.
+
+Ces assertions peuvent également être chiffrées à l'aide de la clé publique du SP. Dans ce cas la SAMLResponse contient d'une part une signature globale, mais contient également des assertions chiffrées.
+
+Le SP validera la signature à l'aide de la clé publique fournie par l'IdP dans le metadata.xml et décryptera les assertions à l'aide de sa clé privée.
+
+== 🔐 Modèle de confiance
+
+|===
+| Rôle | Possède la **clé privée** pour … | Fait circuler la **clé publique / certificat** via …
+|------|---------------------------------|------------------------------------------------------
+| **IdP** | • Signer chaque `SAMLResponse` (et éventuellement l’`Assertion`) | `metadata.xml` de l’IdP ⇒ remis au **SP**
+| **SP** | • *Optionnel* : signer la `SAMLRequest`<br>• *Optionnel* : déchiffrer une `EncryptedAssertion` | `metadata.xml` du SP ⇒ remis à l’**IdP**, signer les paramètres d'URL.
+|===
+
+* Remarque : si l’`Assertion` est chiffrée, l’IdP chiffre avec la **clé publique du SP** et seul le SP peut déchiffrer avec sa clé privée.
+
+== 📤 Exemple complet de `SAMLRequest`
+
+[source,xml]
+----
+<samlp:AuthnRequest
+    xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+    xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+    ID="_12345"
+    Version="2.0"
+    IssueInstant="2025-07-10T08:00:00Z"
+    Destination="https://idp.example.com/sso"
+    AssertionConsumerServiceURL="https://sp.example.com/saml/acs"
+    ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST">
+  <saml:Issuer>https://sp.example.com/metadata</saml:Issuer>
+  <samlp:NameIDPolicy
+      Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+      AllowCreate="true"/>
+  <samlp:RequestedAuthnContext Comparison="exact">
+    <saml:AuthnContextClassRef>
+      urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport
+    </saml:AuthnContextClassRef>
+  </samlp:RequestedAuthnContext>
+</samlp:AuthnRequest>
+----
+
+== 📥 Exemple complet de `SAMLResponse`
+
+[source,xml]
+----
+<samlp:Response
+    xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+    ID="_response123"
+    InResponseTo="_12345"
+    Version="2.0"
+    IssueInstant="2025-07-10T08:00:10Z"
+    Destination="https://sp.example.com/saml/acs">
+  <saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+    https://idp.example.com
+  </saml:Issuer>
+  <samlp:Status>
+    <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+  </samlp:Status>
+
+  <saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+      ID="_assertion123"
+      IssueInstant="2025-07-10T08:00:10Z"
+      Version="2.0">
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+
+    <saml:Subject>
+      <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">
+        user@example.com
+      </saml:NameID>
+      <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+        <saml:SubjectConfirmationData
+            InResponseTo="_12345"
+            NotOnOrAfter="2025-07-10T08:05:00Z"
+            Recipient="https://sp.example.com/saml/acs"/>
+      </saml:SubjectConfirmation>
+    </saml:Subject>
+
+    <saml:Conditions NotBefore="2025-07-10T08:00:00Z" NotOnOrAfter="2025-07-10T08:05:00Z">
+      <saml:AudienceRestriction>
+        <saml:Audience>https://sp.example.com/metadata</saml:Audience>
+      </saml:AudienceRestriction>
+    </saml:Conditions>
+
+    <saml:AuthnStatement AuthnInstant="2025-07-10T08:00:05Z">
+      <saml:AuthnContext>
+        <saml:AuthnContextClassRef>
+          urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport
+        </saml:AuthnContextClassRef>
+      </saml:AuthnContext>
+    </saml:AuthnStatement>
+
+    <saml:AttributeStatement>
+      <saml:Attribute Name="email">
+        <saml:AttributeValue>user@example.com</saml:AttributeValue>
+      </saml:Attribute>
+      <saml:Attribute Name="groups">
+        <saml:AttributeValue>admin</saml:AttributeValue>
+      </saml:Attribute>
+    </saml:AttributeStatement>
+  </saml:Assertion>
+</samlp:Response>
+----
+
+== 📋 Détails des paramètres
+
+=== `AuthnRequest` – Paramètres XML (contenus dans le SAMLRequest)
+
+|===
+| Élément / Attribut | Obligatoire | Description
+
+| `ID` | Oui | Identifiant unique pour le couplage avec `InResponseTo`.
+| `IssueInstant` | Oui | Timestamp ISO 8601.
+| `Destination` | Recommandé | Endpoint SSO de l’IdP (doit matcher celui du metadata).
+| `AssertionConsumerServiceURL` | Oui | Endpoint ACS du SP.
+| `ProtocolBinding` | Non | Binding attendu pour la réponse (`POST`, `Artifact`, etc.).
+| `Issuer` | Oui | `EntityID` du SP.
+| `ForceAuthn` / `IsPassive` | Non | Requiert une nouvelle authentification / pas d’interaction utilisateur.
+| `NameIDPolicy` | Non | Format du `NameID` souhaité (ex: email, transient).
+| `RequestedAuthnContext` | Non | Niveau d’authentification requis (ex: MFA, password).
+| `Signature` (XML-DSig) | Facultatif | Signature XML de la requête (en mode POST, principalement).
+|===
+
+=== `AuthnRequest` – Paramètres de transport (hors XML, en query string)
+
+|===
+| Paramètre HTTP | Obligatoire | Description
+
+| `RelayState` | Non | Donnée opaque transmise par le SP, renvoyée telle quelle par l’IdP.
+| `SigAlg` | Oui si `Signature` | Algorithme utilisé pour signer (`rsa-sha256`, etc.).
+| `Signature` | Oui si signature | Signature HMAC/DSig de la chaîne canonique (base64 du SAMLRequest + SigAlg + RelayState).
+|===
+
+=== `SAMLResponse` / `Assertion`
+
+*XML global
+
+|===
+| Élément / Attribut | Obligatoire | Description
+
+| `ID` (`Response`) | Oui | Identifiant de la réponse.
+| `InResponseTo` | Oui | Fait référence à l’`ID` de la requête.
+| `Destination` | Oui | Doit matcher l’ACS connue du SP.
+| `Issuer` (`Response`) | Oui | `EntityID` de l’IdP.
+| `StatusCode` | Oui | Résultat (`Success`, `Responder`, etc.).
+|===
+
+*Bloc `Assertion`*
+
+|===
+| `ID` (`Assertion`) | Oui | Identifiant unique.
+| `Issuer` (`Assertion`) | Oui | IdP émetteur.
+| `Subject` / `NameID` | Oui | Identité de l’utilisateur.
+| `SubjectConfirmation` | Oui | Contrôle de réception (Recipient, NotOnOrAfter…).
+| `Conditions` | Oui | Fenêtre de validité, restrictions d’audience.
+| `AuthnStatement` | Non | Date et contexte d’auth.
+| `AttributeStatement` | Non | Attributs (`email`, `groups`, etc.).
+| `Signature` | Oui | Signée par la **clé privée de l’IdP**.
+|===
+
+== 🧩 Subtilités et options avancées
+
+* **Bindings** : Redirect (GET, deflate+base64), POST (body base64), Artifact (indirection).
+* **Chiffrement** : `<EncryptedAssertion>` → IdP chiffre avec la clé publique du SP.
+* **RelayState** : jamais sensible, vérifier qu’il ne permet pas de redirection externe.
+* **Conditions** : timestamps anti-replay, `AudienceRestriction`, `Recipient`.
+* **NameID formats** : `emailAddress`, `persistent`, `transient`, `unspecified`.
+* **AuthnContext** : impose password, MFA, certificat X.509, etc.
+
+[NOTE]
+--
+🔐 À propos de RelayState
+
+Le paramètre RelayState permet au SP de conserver un contexte tout au long du cycle SAML (par exemple : URL d'origine, identifiant de session interne, etc.).
+
+Quelques règles et bonnes pratiques :
+
+- Sa valeur est opaque pour l’IdP, qui la retransmet telle quelle dans la réponse.
+- Elle ne doit jamais contenir de données sensibles (ni token, ni identifiant utilisateur).
+- Elle ne doit pas contenir d'URL externe non maîtrisée, pour éviter les attaques de type open redirect.
+- Le SP doit toujours valider cette valeur après réception (ex. : correspondance avec une session temporaire, inclusion dans une whitelist, etc.).
+
+👉 En résumé : c’est un champ libre, mais à manipuler avec précaution, car l’IdP ne le protège pas.
+--
+
+== 🔀 Autres bindings SAML (flux alternatifs)
+
+SAML 2.0 propose plusieurs méthodes de transport pour les messages (`AuthnRequest`, `Response`, etc.), appelées *bindings*. Chaque binding définit la façon dont le message est encodé, transmis et signé.
+
+=== 1. HTTP-Redirect Binding (SP-initié via GET)
+
+* Utilisé pour : `AuthnRequest`
+* Transport : Requête GET avec `SAMLRequest` compressé (deflate), encodé en base64 dans l’URL
+* Signature : des paramètres d’URL (`SAMLRequest`, `RelayState`, `SigAlg`, `Signature`)
+* Avantages :
+** Simplicité d’implémentation
+** Aucun besoin de page HTML (GET direct)
+* Inconvénients :
+** Taille maximale de l’URL (≈ 2 Ko)
+** Signature XML non possible (seulement signature d’URL)
+
+=== 2. HTTP-POST Binding (SP ou IdP via POST)
+
+* Utilisé pour : `AuthnRequest`, `SAMLResponse`
+* Transport : Donnée encodée en base64, transmise dans un champ `input` d’un formulaire HTML
+* Signature : XML-DSig (signature intégrée dans le message XML)
+* Avantages :
+** Pas de limite de taille
+** Signature XML complète possible
+* Inconvénients :
+** Nécessite une soumission HTML (formulaires)
+** Moins adapté aux flux purement API
+
+=== 3. HTTP-Artifact Binding
+
+* Utilisé pour : `AuthnRequest`, `SAMLResponse` (indirect)
+* Transport :
+** Le SP envoie une `AuthnRequest` comme d’habitude
+** L’IdP ne renvoie pas directement une `SAMLResponse`, mais un `Artifact` (identifiant court)
+** Le SP résout ensuite cet `Artifact` via une requête SOAP (`ArtifactResolve`)
+* Avantages :
+** L’`Assertion` ne transite pas dans le navigateur (meilleure sécurité)
+* Inconvénients :
+** Implémentation plus complexe
+** Requiert un canal backchannel SOAP sécurisé
+
+=== 4. SOAP Binding (backchannel sécurisé)
+
+* Utilisé pour : opérations serveur-à-serveur (ex : `ArtifactResolve`, `LogoutRequest`, `AttributeQuery`)
+* Transport : Requêtes POST avec messages XML enveloppés dans du SOAP
+* Avantages :
+** Très sécurisé
+** Permet des échanges silencieux et synchrones entre serveurs
+* Inconvénients :
+** Plus complexe à mettre en œuvre
+** Peu adapté aux interactions front utilisateur
+
+=== 📊 Récapitulatif
+
+|===
+| Binding | Méthode HTTP | Message typique | Utilisation principale | Signature supportée
+
+| HTTP-Redirect | GET (URL query) | `SAMLRequest` | AuthnRequest (SP-initié) | Signature d’URL (query string)
+| HTTP-POST | POST (formulaire) | `SAMLResponse`, `SAMLRequest` | Réponse IdP → SP (ACS) | Signature XML (XML-DSig)
+| HTTP-Artifact | GET + POST SOAP | `Artifact` + `SAMLResponse` | Transmission sécurisée des réponses | Signature XML (dans réponse résolue)
+| SOAP | POST (XML/SOAP) | `LogoutRequest`, `AttributeQuery` | Backchannel / API | Signature XML
+|===
+
+[NOTE]
+--
+🎯 En pratique :
+
+- **HTTP-Redirect** est souvent utilisé pour initier l’authentification.
+- **HTTP-POST** est le plus courant pour la transmission des `SAMLResponse`.
+- **HTTP-Artifact** est utilisé quand la confidentialité prime (ex : échanges sensibles).
+- **SOAP** est réservé aux opérations silencieuses ou techniques (ex : déconnexion, résolution d’`Artifact`).
+--
+
+== 🧠 NOTE ANNEXE - Mécanismes cryptographiques (signature vs chiffrement)
+
+|===
+| Objectif | Clé utilisée pour écrire | Clé utilisée pour lire | Sens d'utilisation
+
+| **Signature** | Clé **privée** de l’émetteur | Clé **publique** de l’émetteur | « Je prouve que **moi seul** ai écrit ça »
+| **Chiffrement** | Clé **publique** du destinataire | Clé **privée** du destinataire | « Je t’envoie un message que **toi seul** peux lire »
+|===
+
+* Une **signature** authentifie l’émetteur.
+* Un **chiffrement** garantit la confidentialité.
+
+== Annexe : Sécurité avancée SAML
+
+=== ⚠ 1. Dangers critiques de RelayState
+
+==== Risque principal : Open Redirect
+
+Lorsque le relayState est utilisé comme redirection cela ouvre la porte à cette faille:
+
+[plantuml]
+----
+@startuml
+participant "Attaquant" as A
+participant "SP" as SP
+participant "IdP" as IdP
+participant "Victime" as V
+
+A -> V : Lien malveillant avec RelayState externe
+V -> SP : Tente d'accéder à une ressource
+SP -> IdP : Redirection avec SAMLRequest + RelayState=hacker.com
+IdP -> V : Demande d'authentification
+V -> IdP : Saisie des credentials
+IdP -> SP : SAMLResponse + RelayState=hacker.com
+SP -> V : Redirection vers hacker.com avec token de session !
+@enduml
+----
+
+==== Contre-mesures obligatoires
+
+[source,ruby]
+----
+# Validation du RelayState (exemple Ruby)
+def valid_relay_state?(state)
+  allowed_domains = [
+    'https://app.mon-domaine.fr',
+    'https://portail.mon-domaine.fr'
+  ]
+  allowed_domains.any? { |domain| state.start_with?(domain) }
+end
+----
+
+==== Bonnes pratiques
+
+* Ne jamais utiliser `RelayState` pour des URLs complètes
+* Stocker un identifiant de session côté SP → mapper à une URL interne
+* Implémenter une allowlist stricte de domaines
+* Auditer régulièrement les redirections
+
+=== ⏱ 2. Bonnes pratiques des timestamps
+
+==== Paramètres critiques
+[source,xml]
+----
+<!-- Assertion -->
+<Conditions NotBefore="2025-07-17T09:00:00Z"
+           NotOnOrAfter="2025-07-17T09:05:00Z">
+
+<!-- SubjectConfirmation -->
+<SubjectConfirmationData
+  NotOnOrAfter="2025-07-17T09:05:00Z"
+  Recipient="https://sp.example.com/acs"/>
+----
+
+==== Règles de validation
+[cols="1,2,2"]
+|===
+| Paramètre | Tolérance max | Vérification côté SP
+| `NotBefore` | 1 minute | Refuser si > heure courante + tolérance
+| `NotOnOrAfter` | 3 minutes | Refuser si < heure courante
+| `IssueInstant` | 5 minutes | Rejet si dépassement
+|===
+
+==== Implémentation recommandée
+[source,python]
+----
+# Pseudocode de validation
+def validate_timestamps(assertion):
+    now = datetime.utcnow()
+    if assertion.not_before > now + timedelta(minutes=1):
+        raise InvalidAssertion("NotBefore trop dans le futur")
+    if assertion.not_on_or_after < now - timedelta(minutes=3):
+        raise InvalidAssertion("Assertion expirée")
+----
+
+=== 🔏 3. Statut des signatures
+
+==== Signature des Assertions (SAMLResponse)
+[WARNING]
+====
+*OBLIGATOIRE* dans 99% des cas +
+Seul mécanisme fiable d'authentification de l'IdP +
+Exceptions rares : environnements fermés de test
+====
+
+==== Signature des Requêtes (SAMLRequest)
+[cols="2,2"]
+|===
+| Contexte | Recommandation
+| Binding HTTP-Redirect (GET) | **Fortement conseillée**
+| Binding HTTP-POST | Optionnelle
+| Environnements sensibles | Obligatoire
+| IdP publics (Azure AD, Okta) | Souvent requise
+|===
+
+==== Checklist de sécurité
+* [*] Toujours valider la signature des assertions
+* [*] Signer les SAMLRequest en Redirect (GET)
+* [*] Vérifier les metadata IdP/SP régulièrement
+* [*] Utiliser des ID uniques par requête
+
+==== Mesures complémentaires contre le rejeu
+* Utiliser des identifiants uniques (`ID`) avec expiration courte (≤ 5 min)
+* Implémenter un registre temporaire des requêtes traitées
+* Signer systématiquement les requêtes
