@@ -1,0 +1,266 @@
+= 🔐 Hashs cryptographiques & signatures numériques – Fiche ultra complète
+
+:toc: left
+:toclevels: 3
+:numbered:
+:source-highlighter: rouge
+
+== 🧩 Introduction
+
+Les fonctions de hachage cryptographiques et les signatures numériques sont des briques fondamentales de la sécurité informatique. Elles assurent l’intégrité, l’authenticité et la non-répudiation des données.
+
+== 1️⃣ Hash cryptographique : définition et propriétés
+
+Une fonction de hachage cryptographique transforme un message de taille arbitraire en une sortie de taille fixe.
+
+=== Exemple (SHA-256)
+
+[source,shell]
+----
+echo -n "hello" | sha256sum
+# Résultat : 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+----
+
+=== Propriétés attendues
+
+* Déterministe
+* Rapide à calculer
+* Résistance à la pré-image
+* Résistance à la seconde pré-image
+* Résistance aux collisions
+
+=== Usages typiques
+
+* Intégrité des fichiers
+* Stockage de mots de passe
+* Commit Git
+* Preuve de travail (ex : Bitcoin)
+
+== 2️⃣ Stockage de mots de passe
+
+=== Mauvaise pratique
+
+[source,text]
+----
+hash("password123") == hash("password123")
+→ vulnérable aux rainbow tables
+----
+
+=== Bonne pratique : salage + KDF
+
+[source,text]
+----
+hash("password123" + salt)
+→ rend les attaques pré-calculées inutiles
+----
+
+Utiliser des KDF comme :
+
+* bcrypt
+* scrypt
+* argon2id (recommandé)
+
+== 3️⃣ Signatures numériques ✍️
+
+Permettent de garantir :
+
+* Authenticité
+* Intégrité
+* Non-répudiation
+
+=== Fonctionnement général
+
+1. Le signataire calcule le hash du message.
+2. Il chiffre ce hash avec sa clé privée → signature.
+3. Le destinataire déchiffre avec la clé publique.
+4. Il calcule lui-même le hash.
+5. Il compare les deux valeurs.
+
+=== Algorithmes classiques
+
+[cols="1,2",options="header"]
+|===
+| Algorithme | Détails
+| RSA        | Repose sur la factorisation
+| ECDSA      | Plus léger, basé sur les courbes elliptiques
+| EdDSA      | Moderne et sécurisé (Ed25519)
+|===
+
+== 4️⃣ Exemple complet avec OpenSSL
+
+=== Étape 1 : Générer une paire de clés
+
+[source,shell]
+----
+# Clé privée RSA 2048 bits
+openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:2048
+
+# Clé publique extraite
+openssl rsa -pubout -in private.pem -out public.pem
+----
+
+.Fichier `private.pem` (extrait)
+[source, text]
+----
+-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASC...
+...
+-----END PRIVATE KEY-----
+----
+
+.Fichier `public.pem` (extrait)
+[source, text]
+----
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...
+...
+-----END PUBLIC KEY-----
+----
+
+=== Étape 2 : Créer un fichier à signer
+
+[source,shell]
+----
+echo "message à signer" > message.txt
+----
+
+.Contenu de `message.txt`
+[source, text]
+----
+message à signer
+----
+
+=== Étape 3 : Calculer le hash (optionnel)
+
+[source,shell]
+----
+openssl dgst -sha256 message.txt
+----
+
+.Sortie
+[source,text]
+----
+SHA256(message.txt)= 7da95fb20b36743ab6bd3be5cc49f71ee350aaf62e78f04b650cf3a9de7cc11e
+----
+
+→ Il s’agit du **hash SHA-256** du contenu `message à signer`.
+
+=== Étape 4 : Signer le fichier (signature binaire)
+
+[source,shell]
+----
+openssl dgst -sha256 -sign private.pem -out message.sig message.txt
+----
+
+→ Le fichier `message.sig` contient une **signature binaire RSA** du hash précédent.
+
+Pour le rendre lisible :
+
+[source,shell]
+----
+base64 message.sig
+----
+
+.Exemple (résultat base64 de la signature)
+[source,text]
+----
+GRe4eIfRQQcsKMm8c+1GIdLr2c2q6L4qFzA3YH2w0LGphDj/oxYMoK8DJf+EZV3RGZQg...
+----
+
+=== Étape 5 : Vérifier la signature
+
+[source,shell]
+----
+openssl dgst -sha256 -verify public.pem -signature message.sig message.txt
+----
+
+.Sortie attendue
+[source,text]
+----
+Verified OK
+----
+
+→ Cela prouve que le message a été signé avec la clé privée **correspondante** à `public.pem`, **sans modification du message**.
+
+== 5️⃣ Comparaison : hash vs signature
+
+[cols="1,2,2",options="header"]
+|===
+| Fonction              | Hash         | Signature
+| Intégrité             | ✅           | ✅
+| Authenticité          | ❌           | ✅
+| Non-répudiation       | ❌           | ✅
+| Algorithme            | Symétrique   | Asymétrique
+| Recalculable          | Oui          | Non
+|===
+
+== 6️⃣ Attaques classiques
+
+=== Sur les hash
+
+* Collision (MD5, SHA-1)
+* Rainbow tables
+* Length extension
+* Birthday attack
+
+=== Sur les signatures
+
+* Mauvais encodages ASN.1/DER
+* Réutilisation de nonce (ex : DSA)
+* Clés faibles ou générées de façon non aléatoire
+
+== 7️⃣ Bonnes pratiques
+
+=== Pour les hash
+
+* Ne jamais utiliser MD5 ou SHA-1
+* Préférer SHA-256, SHA-3 ou BLAKE3
+* Toujours salter les mots de passe
+* Utiliser un KDF moderne (argon2id)
+
+=== Pour les signatures
+
+* Privilégier EdDSA (Ed25519)
+* Ne jamais réutiliser de nonce
+* Signer uniquement des contenus bien délimités
+* Toujours valider le format des messages et clés
+
+== 8️⃣ Cas concrets
+
+=== Git
+
+* Utilise SHA-1 ou SHA-256 pour le contenu
+* Commits signables via GPG (`git commit -S`)
+* Authentification partielle seulement (pas automatique)
+
+=== JWT
+
+* Utilise la signature dans les jetons (ex: RS256, HS256)
+* Le header contient l’algorithme
+* Attention aux implémentations acceptant `alg: none`
+
+=== TLS / HTTPS
+
+* Le certificat est signé par une autorité
+* La chaîne de confiance est assurée par signature
+* Les échanges utilisent des hachages (SHA-256 ou mieux)
+
+== 9️⃣ Aller plus loin
+
+=== Librairies recommandées
+
+[cols="1,2",options="header"]
+|===
+| Langage | Librairies
+| Python  | hashlib, cryptography
+| Go      | crypto/ed25519, golang.org/x/crypto
+| PHP     | password_hash(), openssl_sign()
+| Rust    | ring, ed25519-dalek
+| Node.js | crypto, sodium-native
+|===
+
+=== Outils utiles
+
+* `openssl dgst`
+* `sha256sum`, `blake3sum`
+* `gpg --sign`, `gpg --verify`
