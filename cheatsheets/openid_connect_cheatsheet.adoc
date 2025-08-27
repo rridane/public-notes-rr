@@ -1,0 +1,427 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+:toclevels: 3
+:numbered:
+
+= OpenID Connect – Cheatsheet
+
+== Basics
+
+OIDC apporte :
+
+* 🎯 Une **valeur de scope** standardisée : `openid`
+→ indispensable pour activer les fonctionnalités d’authentification OIDC
+* 🎟️ Un **nouveau type de token** : `id_token` (JWT signé contenant l’identité de l’utilisateur)
+* 🌐 Des **endpoints supplémentaires** :
+- `/.well-known/openid-configuration` (discovery dynamique)
+- `/userinfo` (profil utilisateur à jour)
+
+OIDC **étend scope** avec des valeurs standardisées qui activent des fonctionnalités OIDC.
+
+[cols="1,3",options="header"]
+|===
+| Scope             | Description
+| `openid`          | 🔐 Active le mode OpenID Connect → déclenche la délivrance d’un `id_token`
+| `profile`         | 📄 Demande les claims de profil utilisateur (nom, prénom, etc.)
+| `email`           | ️Demande l’adresse email (`email`, `email_verified`)
+| `address`         | Demande l'adresse postale
+| `phone`           | Demande le numéro de téléphone + statut de vérification
+| `offline_access`  | Demande un `refresh_token` pour renouveler les tokens sans interaction
+|===
+
+[IMPORTANT]
+====
+Si `openid` est **absent**, la requête est traitée comme du **pur OAuth 2.0**
+→ Aucune fonction OIDC ne sera déclenchée (pas de `id_token`, pas de `/userinfo`).
+====
+
+[cols="1,2,2",options="header"]
+|===
+| Champ            | Déclenché par         | Description
+
+| `access_token`   | Tous les flux OAuth   | Jeton d’accès à l’API (Bearer token)
+| `expires_in`     | Tous les flux OAuth   | Durée de vie de l’`access_token` (en secondes)
+| `scope`          | Tous les flux OAuth   | Scopes réellement accordés par l’AS
+
+| `id_token`       | `scope=openid`        | JWT signé contenant l’identité de l’utilisateur
+| `refresh_token`  | `scope=offline_access` + flux autorisé | Jeton longue durée permettant d’obtenir un nouvel `access_token`
+|===
+
+Scopes `profile`, `email`, `address`, `phone` : demander des informations spécifiques sur l’utilisateur. Les claims apparaissent dans l'`id_token` ou via `/userinfo`.
+
+[cols="1,2,3",options="header"]
+|===
+| Scope         | Claims possibles                 | Description
+
+| `openid`      | `sub`                            | Identifiant unique de l’utilisateur (obligatoire)
+|               | *(+ autres claims selon config)* | Certains serveurs ajoutent `email`, `name`, etc. par défaut dans `id_token`
+
+| `profile`     | `name`                           | Nom complet
+|               | `given_name`                     | Prénom
+|               | `family_name`                    | Nom de famille
+|               | `middle_name`                    | Deuxième prénom
+|               | `nickname`                       | Surnom
+|               | `preferred_username`             | Identifiant court ou pseudo
+|               | `profile`                        | URL du profil (ex : réseaux sociaux)
+|               | `picture`                        | URL de la photo de profil
+|               | `website`                        | URL personnelle
+|               | `gender`                         | Sexe
+|               | `birthdate`                      | Date de naissance (ISO 8601)
+|               | `zoneinfo`                       | Fuseau horaire (ex : "Europe/Paris")
+|               | `locale`                         | Langue préférée (ex : "fr-FR")
+|               | `updated_at`                     | Date de dernière mise à jour du profil (timestamp)
+
+| `email`       | `email`                          | Adresse email
+|               | `email_verified`                 | Booléen indiquant si l’email a été vérifié
+
+| `address`     | `address`                        | Objet JSON avec :
+- `formatted`
+- `street_address`
+- `locality`
+- `region`
+- `postal_code`
+- `country`
+
+| `phone`       | `phone_number`                   | Numéro de téléphone
+|               | `phone_number_verified`          | Booléen indiquant si le numéro a été vérifié
+|===
+
+Certains claims renseignent **le contexte de l’authentification** de l’utilisateur. Utiles pour tracer la sécurité du login, vérifier qu’une authentification forte a été utilisée, ou satisfaire à des contraintes réglementaires (ex : authentification MFA, durée de session…).
+
+[source,json]
+----
+{
+  "acr": "urn:mace:incommon:iap:silver",
+  "amr": ["pwd", "mfa"],
+  "auth_time": 1709999400
+}
+----
+
+[cols="1,3",options="header"]
+|===
+| Claim        | Description
+
+| `acr`        | *Authentication Context Class Reference* – Niveau d’authentification atteint (ex : `urn:mace:...:silver`)
+| `amr`        | *Authentication Methods References* – Liste des méthodes utilisées (`pwd`, `otp`, `mfa`, etc.)
+| `auth_time`  | *Authentication Time* – Timestamp (epoch) de l’heure d’authentification initiale
+|===
+
+[NOTE]
+====
+Exemples possibles pour `amr` :
+- `pwd` : mot de passe
+- `otp` : mot de passe à usage unique
+- `mfa` : authentification multi-facteur
+- `sms`, `email` : envoi de code
+- `fido`, `webauthn` : clé physique (FIDO2/WebAuthn)
+====
+
+Ces claims **ne dépendent pas d’un scope** comme `profile` ou `email`.
+
+- Ils sont disponibles uniquement si `scope=openid` est présent
+- Dépendent du fournisseur
+
+[cols="1,3",options="header"]
+|===
+| Fournisseur OIDC | Support des claims `acr`, `amr`, `auth_time`
+
+| Keycloak         | ✅ Oui, configurable (flows, policies)
+| Auth0            | ✅ Oui, `amr`, `auth_time` par défaut ; `acr` sur demande
+| Azure AD         | ✅ Oui, surtout `amr` ; `acr` selon contexte
+| Okta             | ✅ Oui, avec configuration
+| Google Identity  | ❌ Généralement non présents (sauf cas spécifiques)
+|===
+
+Il est possible de demander des claims de manière explicite, cela peut être utile pour des custom claims.
+
+[source,http]
+----
+GET /authorize?
+client_id=client123&
+response_type=code&
+scope=openid&
+claims={
+  "id_token": {
+    "acr": { "essential": true },
+    "auth_time": { "essential": true }
+  }
+}
+----
+
+
+== 💡 Exemple de requête `/authorize` avec tous les scopes
+
+[source,http]
+----
+GET /authorize?
+client_id=client123&
+response_type=code&
+redirect_uri=https://app.com/callback&
+scope=openid profile email offline_access&
+state=abc123&
+nonce=xyz456
+----
+
+* `scope=openid` → Active OIDC, nécessaire pour avoir un `id_token`
+* `profile`, `email` → Demande des infos utilisateur
+* `offline_access` → Demande un `refresh_token`
+
+== 📥 Exemple de réponse `/token` incluant tous les éléments
+
+Après avoir reçu le `code`, le client fait un `POST /token` :
+
+[source,http]
+----
+POST /token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code&
+code=SplxlOBeZQQYbYS6WxSbIA&
+redirect_uri=https://app.com/callback&
+client_id=client123&
+code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+----
+
+Réponse typique :
+
+[source,json]
+----
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR...",
+  "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh_token": "def456uvw",
+  "expires_in": 3600,
+  "token_type": "Bearer",
+  "scope": "openid profile email offline_access"
+}
+----
+
+== 🧬 Exemple de `id_token` décodé
+
+=== En-tête
+[source,json]
+----
+{
+  "alg": "RS256",
+  "typ": "JWT",
+  "kid": "auth-key-1"
+}
+----
+
+=== Payload
+[source,json]
+----
+{
+  "iss": "https://auth.example.com",
+  "sub": "user_123",
+  "aud": "client123",
+  "exp": 1710000000,
+  "iat": 1709999400,
+  "nonce": "xyz456",
+  "email": "user@example.com",
+  "email_verified": true,
+  "name": "Jean Dupont"
+}
+----
+
+[cols="1,3",options="header"]
+|===
+| Claim | Description
+
+| `iss` | Issuer : URL du serveur d'autorisation
+| `sub` | Subject : identifiant unique de l’utilisateur
+| `aud` | Audience : le `client_id` à qui est destiné ce token
+| `exp` / `iat` | Dates d’expiration / d’émission
+| `nonce` | Jeton anti-rejeu généré par le client (doit être vérifié)
+| `email`, `name` | Claims issus des scopes demandés (`email`, `profile`, etc.)
+|===
+
+[TIP]
+====
+Le client doit :
+- vérifier la **signature du JWT** (`jwks_uri`)
+- vérifier les valeurs de `aud`, `iss`, `exp`
+- valider que `nonce` correspond à celui envoyé à `/authorize`
+====
+
+[NOTE]
+====
+👉 L’`id_token` est le cœur du mécanisme d’authentification de l’utilisateur en OIDC.
+Il permet de **vérifier une session sans faire d’appel au serveur**, contrairement à `/userinfo`.
+
+ℹ️ Le endpoint `/userinfo` retourne des informations **plus fraîches**, utiles si le `id_token` est partiel ou ancien.
+====
+
+== 🔐 Validation du id_token
+
+1. Récupérer la clé publique via `jwks_uri`
+2. Vérifier la **signature** du JWT
+3. Valider les claims suivants :
+- `iss` == issuer attendu
+- `aud` == client_id
+- `exp` non expiré
+- `nonce` correspond à celui fourni
+
+[NOTE]
+====
+Certains serveurs mettent toutes les informations dans id_token, rendant /userinfo inutile (si ce n'est pour s'assurer que les informations sont à jour)
+====
+
+== 🔐 Sécurité – Le `nonce`
+
+Permet de se prémunir contre les attaques de rejeu :
+- Le client génère un `nonce` à l’étape `/authorize`
+- Le serveur le renvoie dans le `id_token`
+- Le client **doit vérifier** que la valeur correspond
+
+== 🧭 Flux complet OIDC (Authorization Code + PKCE)
+
+[plantuml]
+----
+@startuml
+actor "Utilisateur" as User
+participant "App (SPA / mobile)" as App
+participant "Authorization Server / IdP" as AS
+
+== Étape 1 – /authorize ==
+App -> AS : GET /authorize?client_id=...&scope=openid profile&nonce=abc...
+
+AS -> User : Formulaire de login
+
+User -> AS : Login
+AS -> App : Redirection /callback?code=xyz&state=...
+
+== Étape 2 – /token ==
+App -> AS : POST /token + code + code_verifier
+AS -> App : access_token + id_token + refresh_token
+
+== Étape 3 – /userinfo ==
+App -> AS : GET /userinfo (avec access_token)
+AS -> App : JSON : nom, email, etc.
+@enduml
+----
+
+== 🔁 Fonctionnement du `refresh_token`
+
+Le `refresh_token` :
+- permet de **prolonger une session** sans que l’utilisateur ne se reconnecte,
+- est obtenu **uniquement si le scope `offline_access` a été demandé**,
+- peut être **refusé** par le serveur (ex: clients publics JS, configuration IdP...),
+- est **rotatif** sur certains serveurs : chaque utilisation en invalide l’ancien.
+
+=== 🧭 Flux d’échange du refresh_token
+
+[source,http]
+----
+POST /token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=refresh_token&
+client_id=client123&
+refresh_token=def456uvw
+----
+
+Réponse typique (rotation activée) :
+
+[source,json]
+----
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "id_token": "eyJhbGciOiJSUzI1NiIs...",
+  "refresh_token": "ghi789rst", // nouveau
+  "expires_in": 3600,
+  "token_type": "Bearer"
+}
+----
+
+== 🔍 Discovery – /.well-known/openid-configuration
+
+[source,http]
+----
+GET /.well-known/openid-configuration
+----
+
+[source,json]
+----
+{
+  "issuer": "https://auth.example.com",
+  "authorization_endpoint": ".../authorize",
+  "token_endpoint": ".../token",
+  "userinfo_endpoint": ".../userinfo",
+  "jwks_uri": ".../.well-known/jwks.json",
+  "response_types_supported": ["code", "id_token"],
+  "id_token_signing_alg_values_supported": ["RS256"]
+}
+----
+
+== 📥 /userinfo – Profil utilisateur
+
+[source,http]
+----
+GET /userinfo
+Authorization: Bearer <access_token>
+----
+
+[source,json]
+----
+{
+  "sub": "user_123",
+  "email": "user@example.com",
+  "name": "Jean Dupont"
+}
+----
+
+=== 📋 Liste des claims retournés par `/userinfo`
+
+Les claims retournés par `/userinfo` dépendent :
+- des `scopes` demandés (`profile`, `email`, etc.)
+- des claims disponibles et autorisés pour le client
+
+Exemple de réponse :
+[source,json]
+----
+{
+  "sub": "user_123",
+  "name": "Jean Dupont",
+  "email": "jean.dupont@example.com",
+  "email_verified": true,
+  "locale": "fr-FR",
+  "updated_at": 1712345678
+}
+----
+
+[NOTE]
+====
+Le contenu du `id_token` et du `/userinfo` peut être personnalisé côté serveur :
+- via des **mappers** (ex : Keycloak)
+- via des **règles ou hooks** (ex : Auth0 Rules)
+====
+
+== 💡 Autres endpoints OIDC (optionnels)
+
+[cols="1,3",options="header"]
+|===
+| Endpoint | Description
+
+| `/logout` ou `/end_session` | Permet de déclencher une déconnexion centralisée (SSO) du serveur IdP
+| `/check_session` | Permet de vérifier via iframe que la session IdP est toujours active (rarement utilisé)
+| `/introspect` | Endpoint OAuth utilisé pour vérifier un token opaque (non JWT)
+| `/revocation` | Pour invalider un access_token ou refresh_token manuellement
+| `/jwks.json` | Contient les clés publiques utilisées pour vérifier la signature des `id_token`
+|===
+
+[TIP]
+====
+Les endpoints `/logout`, `/check_session`, etc., sont surtout utilisés dans des architectures SSO complexes (ex: avec Keycloak, Azure AD, etc.).
+====
+
+== 📚 Références utiles
+
+- https://openid.net/specs/openid-connect-core-1_0.html[OIDC Core 1.0 – Spécification officielle]
+- https://auth0.com/docs/protocols[Auth0 – Protocoles pris en charge]
+- https://www.keycloak.org/docs/latest/securing_apps/index.html[Keycloak – Sécuriser vos apps]
+- https://developer.okta.com/docs/concepts/oauth-openid/[Okta – Concepts OAuth2/OIDC]
