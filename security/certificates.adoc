@@ -1,0 +1,782 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+
+= Deep dive in Certificates
+
+== Définition théorique
+
+Un certificat est une pièce d'identité numérique. Elle contient plusieurs champs qui ont tous leur importance et que nous détaillons ici:
+
+Avant de voir ce qu'il contient en détail, il parait judicieux d'expliquer le flux d'une connexion https de manière imagée.
+
+== Flux complet depuis la connexion du navigateur au serveur
+
+Lorsque le navigateur tente de se connecter au serveur, le serveur présente son certificat sous la forme DER (Encodage binaire brut). Il contient en réalité une séquence de DER. Il est possible de les consulter en inspectant le certificat du site, il est alors présenté par le navigateur encodé en base64 puis urlencodé. Chaque certificat est séparé par certs=. Nous avons ainsi:
+
+[source,bash]
+----
+certificat?cert=base64_url_encoded_der_cert_root_ca&cert=base64_url_encoded_der_cert_intermediate_ca&cert=base64_url_encoded_der_cert_leaf_ca
+----
+
+Lorsque le serveur envoie les certificats à la machine qui a le navigateur, il ne fournit pas le CA, qui est toujours stocké localement, c'est la garantie ultime de la chaine de certification, elle doit être locale. En revanche il envoie tous les intermediate.
+
+Le navigateur consulte le leaf certificate, c'est la pièce d'identité du serveur:
+
+[source,bash]
+----
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number: 03:45:df:11:22:...
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: C=US, O=Let's Encrypt, CN=R3
+        Validity
+            Not Before: Sep 10 12:00:00 2025 GMT
+            Not After : Dec  9 12:00:00 2025 GMT
+        Subject: CN=www.example.com
+        Subject Public Key Info:
+            Public Key Algorithm: rsaEncryption
+                RSA Public-Key: (2048 bit)
+        X509v3 extensions:
+            X509v3 Basic Constraints: critical
+                CA:FALSE
+            X509v3 Key Usage: critical
+                Digital Signature, Key Encipherment
+            X509v3 Extended Key Usage:
+                TLS Web Server Authentication, TLS Web Client Authentication
+            X509v3 Subject Alternative Name:
+                DNS:www.example.com
+            Authority Information Access:
+                OCSP - URI:http://r3.o.lencr.org
+                CA Issuers - URI:http://r3.i.lencr.org/
+            CRL Distribution Points:
+                URI:http://r3.i.lencr.org/
+
+----
+
+En substance, le serveur se présente de la manière suivante.
+
+* Ma pièce d'identité est de version 3, son identifiant unique est 03:45...
+* Elle est valide jusqu'au 9 décembre 2025, donc en cours de validité
+* Je représente le nom de domaine www.example.com
+* Voici ma clé publique si vous voulez bien établir une session tls avec moi.
+* Comme vous pouvez le constater ma pièce d'identité est signée de l'organisation Let's Encrypt, dont le common name est R3
+* Pour le signer l'algorithme utilisé est Sha256
+* Vous devez avoir sa pièce d'identité en même temps, vérifiez avec sa clé publique, faites le sha de tout mon certificat, décryptez la signature avec la clé publique, et vous verrez que les deux sha sont identiques
+
+Le navigateur reprends le flux:
+
+* Faisons cela
+__Le navigateur prends tout le contenu du certificat, clé publique compris, donc le contenu en entier, il retire le bloc SignatureAlgorithm et la signatureValue, il créé le sha du contenu__
+__D'un autre côté, il récupère la clé publique de l'intermediate CA, decrypte la signature avec, et obtient le sha qu'il faut avoir__
+__Il les compare ils sont égaux__
+* Effectivement, c'est bien l'intermediate CA qui a signé votre pièce d'identité.
+
+[NOTE]
+--
+On appelle **TSBCertificate** le certificat non signé, autrement dit tout sauf la signatureValue (signature) et le bloc signatureAlgorithm
+--
+
+Le serveur:
+
+* Vous voyez tout est en règle
+
+Le navigateur:
+
+* Une minute, je ne connais pas l'intermediate CA. A priori sa pièce d'identité est signé par le root CA xx. Laissez moi comparer le sha de la même manière à partir de la pièce d'identité du root CA que j'ai en ma possession.
+* Les sha correspondent, tout est en ordre
+
+Le serveur:
+
+* Parfait, maintenant que tu me fais confiance, établissons une clé de session (ECDHE → clé symétrique AES/ChaCha).
+
+== Contenu d’un certificat X.509
+
+=== Les différentes parties d'un certificat
+
+Un certificat X.509 est un document structuré (ASN.1, DER/PEM) qui associe une clé publique à une identité et qui est signé par une autorité comme nous l'avons vu dans le flux décrie précédemment.
+Il se compose de trois parties principales :
+
+1. **TBSCertificate** (To Be Signed Certificate) → les données qui seront signées
+2. **SignatureAlgorithm** → algorithme de signature utilisé
+3. **SignatureValue** → signature du TBSCertificate par la clé privée de l’issuer
+
+=== TBSCertificate (les données du certificat)
+
+
+[source,bash]
+----
+
+# =========================================================
+# Structure complète d’un certificat X.509
+# =========================================================
+
+# TBSCertificate (les données du certificat, "To Be Signed")
+# C’est cette partie qui est signée par l’autorité émettrice.
+# Elle contient toutes les informations d’identité, de validité,
+# de clé publique et d’extensions éventuelles.
+
+Version
+# La version du standard X.509 utilisée.
+# Version 1 : tout premier standard (rare, obsolète).
+# Version 2 : ajout de champs uniques (peu utilisé).
+# Version 3 : le standard actuel, supporte les extensions (X.509v3).
+
+Serial Number
+# Numéro unique attribué par la CA au certificat.
+# Sert notamment à identifier un certificat dans une liste de révocation (CRL).
+
+Signature Algorithm
+# L’algorithme utilisé par l’issuer (CA) pour signer le certificat.
+# Combine un algorithme de hash (SHA256, SHA384, SHA512…) avec un algorithme de signature (RSA, ECDSA, Ed25519…).
+# Exemple : sha256WithRSAEncryption, ecdsa-with-SHA384.
+
+Issuer
+# L’identité de l’autorité de certification (CA) qui a signé le certificat.
+# Champs possibles (certains obligatoires, d’autres optionnels) :
+C  = Country # (pays)
+ST = State / Province # (état/province)
+L  = Locality # (ville)
+O  = Organization # (organisation)
+OU = Organizational Unit # (unité organisationnelle)
+CN = Common Name # (nom usuel, ex: "R3" pour Lets Encrypt)
+
+Validity
+Not Before :
+# Date/heure à partir de laquelle le certificat est valide.
+Not After  :
+# Date/heure d’expiration du certificat.
+
+Subject
+# L’identité du détenteur du certificat (le "titulaire").
+# Structure identique à l’issuer (C, ST, L, O, OU, CN).
+# Historiquement, CN contenait le FQDN (www.example.com).
+# Aujourd’hui, le champ SubjectAltName (SAN) est utilisé pour les DNS.
+
+Subject Public Key Info
+Public Key Algorithm :
+# Algorithme de clé publique (RSA, ECDSA, Ed25519…).
+# Décrit aussi les paramètres (taille de clé RSA, courbe elliptique, etc.).
+Public Key :
+# La clé publique elle-même (exprimée en hexadécimal/DER).
+# Le navigateur utilisera cette clé pour vérifier la signature TLS lors du handshake.
+
+Unique Identifiers # (optionnel, rarement utilisé)
+Issuer Unique ID :
+# Identifiant unique de l’issuer.
+Subject Unique ID :
+# Identifiant unique du subject.
+# Très peu utilisés aujourd’hui, remplacés par les extensions modernes.
+
+# ---------------------------------------------------------
+# Extensions X.509v3
+# ---------------------------------------------------------
+# Les extensions sont le cœur du standard v3.
+# Elles précisent les usages autorisés et ajoutent des contraintes.
+
+BasicConstraints
+# Indique si ce certificat peut signer d’autres certificats.
+CA:TRUE #  → c’est un certificat d’autorité.
+# CA:FALSE → c’est un certificat utilisateur/serveur.
+# pathLenConstraint → limite la profondeur de la chaîne d’intermédiaires.
+
+KeyUsage
+# Précise les usages autorisés pour la clé publique.
+# digitalSignature      → signature numérique (TLS, authentification…).
+# nonRepudiation        → preuve non-répudiable (juridique).
+# keyEncipherment       → chiffrement de clé (ex: TLS RSA handshake).
+# dataEncipherment      → chiffrement de données.
+# keyAgreement          → échange de clés (ex: Diffie-Hellman).
+# keyCertSign           → signer d’autres certificats (CA uniquement).
+# cRLSign               → signer une CRL.
+# encipherOnly/decipherOnly → usages très spécifiques.
+
+ExtendedKeyUsage (EKU)
+# Usage plus précis, souvent pour TLS.
+# serverAuth            → authentification serveur TLS.
+# clientAuth            → authentification client TLS.
+# codeSigning           → signature de code.
+# emailProtection       → chiffrement/signature email (S/MIME).
+# timeStamping          → serveur de timestamp.
+# OCSPSigning           → signature de réponses OCSP.
+# ipsecIKE, msCodeInd, msSmartcardLogon → usages spécifiques.
+
+Subject Alternative Name (SAN)
+# Définit les identités supplémentaires associées au certificat.
+# DNS names  → www.example.com, api.example.com
+# IP addresses → 192.168.1.1
+# email addresses
+# URIs
+# UPN (User Principal Name, utile en Active Directory)
+
+Issuer Alternative Name
+# Alias ou autres identités de l’issuer.
+# Parfois utilisé dans les infrastructures complexes.
+
+Subject Key Identifier (SKI)
+# Empreinte (hash) de la clé publique du sujet.
+# Sert de "référence" unique pour relier un certificat à son issuer.
+
+Authority Key Identifier (AKI)
+# Empreinte de la clé publique de l’autorité signataire.
+# Permet au client de retrouver le bon certificat CA dans la chaîne.
+
+CRL Distribution Points
+# Indique où trouver la liste de révocation (CRL).
+# Généralement sous forme d’URL (http://...).
+
+Authority Information Access (AIA)
+# Méthodes pour vérifier ou compléter la chaîne.
+# OCSP URI      → adresse du serveur OCSP.
+# CA Issuers URI → lien pour télécharger le certificat de l’issuer.
+
+Certificate Policies
+# Liste d’OIDs décrivant les politiques de certification appliquées.
+# Peut inclure des URL vers un "Certification Practice Statement" (CPS).
+
+Name Constraints
+# Restreint les noms de domaine/IP pour lesquels ce CA peut signer.
+# Exemple : une CA interne ne peut signer que pour *.exemple.local.
+
+Policy Constraints
+# Contraint l’utilisation des policies dans la chaîne de certification.
+
+Inhibit anyPolicy
+# Interdit d’utiliser le joker "anyPolicy" pour la validation.
+
+OCSP Must-Staple (TLS Feature)
+# Extension TLS spécifique.
+# Indique que le serveur doit inclure une réponse OCSP stapled dans son handshake TLS.
+
+Other possible OIDs
+# Extensions spécifiques, souvent propriétaires ou sectorielles.
+# Exemple : certificats pour cartes d’identité, certificats gouvernementaux, etc.
+
+# ---------------------------------------------------------
+# 2. SignatureAlgorithm
+# ---------------------------------------------------------
+# L’algorithme que l’issuer a utilisé pour signer le TBSCertificate.
+# Exemples :
+# sha256WithRSAEncryption
+# ecdsa-with-SHA256
+# Ed25519
+
+# ---------------------------------------------------------
+# 3. SignatureValue
+# ---------------------------------------------------------
+# La signature numérique (BIT STRING) du TBSCertificate.
+# Calculée par la CA avec sa clé privée.
+# Vérifiable avec la clé publique de l’issuer.
+----
+
+=== Types d’identités dans le SAN
+
+Le champ *Subject Alternative Name (SAN)* peut contenir plusieurs types d’identités, appelés *GeneralName* dans la norme ASN.1.
+Chaque identité doit être précédée d’un préfixe indiquant son type :
+
+* `DNS:...` → nom de domaine (FQDN ou wildcard).
+Exemple : `DNS:www.example.com`, `DNS:*.example.com`
+* `IP:...` → adresse IP (v4 ou v6).
+Exemple : `IP:192.168.0.1`, `IP:2001:db8::1`
+* `URI:...` → identifiant de ressource.
+Exemple : `URI:https://example.com/app`
+* `email:...` → adresse email.
+Exemple : `email:admin@example.com`
+* `UPN:...` → *User Principal Name* (utilisé dans Active Directory).
+Exemple : `UPN:user@example.local`
+
+[NOTE]
+====
+Historiquement, le CN (Common Name) servait pour le nom DNS.
+Aujourd’hui, les navigateurs modernes **n’acceptent plus que les SAN** → si le champ SAN est vide, le certificat est rejeté même si le CN correspond.
+====
+
+[NOTE]
+====
+Attention à la terminologie : le préfixe `DNS:` dans le SAN n’a *aucun lien* avec le protocole DNS.
+Il sert uniquement à indiquer les **noms d’hôte** (hostnames) pour lesquels le certificat est valide.
+
+Exemple :
+* Connexion vers `https://www.example.com` → le client TLS vérifie la présence de `DNS:www.example.com` dans le SAN.
+* Connexion vers `https://192.168.1.1` → le client TLS vérifie la présence de `IP:192.168.1.1` dans le SAN.
+
+C’est donc une vérification d’**identité du serveur** et non une résolution DNS.
+====
+
+[NOTE]
+====
+Le préfixe `email:` dans le SAN est utilisé principalement pour la **messagerie sécurisée (S/MIME)**.
+Il permet de :
+* signer numériquement des emails (authenticité de l’expéditeur),
+* chiffrer des emails (le destinataire utilise la clé publique du certificat lié à `email:`).
+
+En entreprise, il peut aussi servir pour l’authentification utilisateur avec certificats clients.
+====
+
+[NOTE]
+====
+Le préfixe `URI:` permet d’associer un certificat à une **ressource complète** (schéma + chemin).
+Exemples :
+* `URI:sip:alice@example.com` → authentification SIP (VoIP),
+* `URI:ldap:///dc=example,dc=com` → certificat lié à un annuaire LDAP,
+* `URI:urn:example:service:myapp` → identité logique interne.
+
+Peu utilisé dans le web classique (HTTPS), il est surtout présent dans des protocoles spécialisés (LDAP, SIP, systèmes internes).
+====
+
+[NOTE]
+====
+Le préfixe `UPN:` (*User Principal Name*) est typique des environnements **Microsoft Active Directory**.
+Il permet de lier un certificat à un utilisateur via son UPN (`user@example.local`).
+Utilisé pour :
+* l’authentification forte (certificats clients dans AD),
+* la fédération d’identités (Kerberos, smartcards).
+
+Pratiquement absent en dehors des environnements Microsoft.
+====
+
+=== Exemple pratique : CSR avec SAN (DNS et IP)
+
+Pour générer un certificat contenant plusieurs noms (multi-SAN, wildcard, IP), on utilise un fichier de configuration OpenSSL avec une section `[ alt_names ]`.
+
+[source,ini]
+----
+# openssl.cnf (extrait pertinent)
+[ req ]
+default_bits       = 2048
+prompt             = no
+default_md         = sha256
+req_extensions     = req_ext
+distinguished_name = dn
+
+[ dn ]
+C  = FR
+ST = France
+L  = Paris
+O  = MyOrg
+OU = IT
+CN = myapp.local
+
+[ req_ext ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+DNS.1   = myapp.local
+DNS.2   = www.myapp.local
+DNS.3   = *.example.com
+IP.1    = 192.168.1.10
+IP.2    = 10.0.0.5
+----
+
+.Générer la clé privée
+[source,]
+----
+openssl genrsa -out server.key 2048
+----
+
+.Générer la CSR avec SAN (basée sur openssl.cnf)
+[source,]
+----
+openssl req -new -key server.key -out server.csr -config openssl.cnf
+----
+
+Le bloc `[ alt_names ]` permet de préciser plusieurs identités :
+* `DNS.N` pour les noms de domaine (y compris wildcard),
+* `IP.N` pour les adresses IP,
+* éventuellement `email.N` ou `URI.N`.
+
+[NOTE]
+====
+Si tu n’indiques pas les SAN explicitement, certains navigateurs modernes (Chrome, Firefox) **ignorent le CN** et refuseront le certificat.
+====
+
+=== Wildcard et certificats multi-SAN
+
+Les extensions SAN permettent aussi de couvrir plusieurs noms de domaine dans un seul certificat.
+
+* *Wildcard* (`*.example.com`)
+** Le certificat est valable pour tous les sous-domaines d’un domaine.
+** Exemple : `*.example.com` couvre `www.example.com`, `api.example.com`, `mail.example.com`.
+** ⚠️ Ne couvre pas le domaine de base `example.com` (il faut l’ajouter explicitement dans les SAN).
+** Usage courant pour simplifier la gestion de multiples services sous un même domaine.
+** Risque : si la clé privée est compromise, *tous les sous-domaines* sont exposés.
+
+* *Multi-SAN (Subject Alternative Names multiples)*
+** Le certificat peut inclure plusieurs DNS distincts.
+** Exemple :
+
+[source]
+----
+DNS:www.example.com
+DNS:api.example.com
+DNS:shop.example.org
+----
+
+** Permet de sécuriser plusieurs domaines ou services avec un seul certificat.
+** Attention à la gestion : chaque ajout de SAN nécessite un *renouvellement complet* du certificat.
+
+[NOTE]
+====
+Let's Encrypt supporte gratuitement les *wildcards* (via le challenge DNS-01) et les certificats *multi-SAN* (jusqu’à 100 domaines par certificat).
+====
+
+== PKI et gestion des certificats
+
+Une PKI (Public Key Infrastructure) est l’ensemble des composants, politiques et procédures qui permettent de gérer les certificats numériques et les clés associées.
+Elle définit comment les certificats sont créés, signés, distribués, validés et révoqués.
+
+=== Composants d’une PKI
+
+* Root CA
+** Autorité de certification racine.
+** C’est l’ultime point de confiance.
+** Elle signe directement les certificats intermédiaires.
+** Elle est généralement stockée hors-ligne pour limiter les risques.
+
+* Intermediate CA
+** Autorités subordonnées au Root CA.
+** Elles émettent les certificats pour les serveurs et utilisateurs.
+** Permettent de protéger le Root CA (on signe avec l’intermédiaire, pas directement avec le root).
+
+* Registration Authority (RA)
+** Composant optionnel.
+** Vérifie l’identité des demandeurs avant qu’un certificat soit émis par la CA.
+
+* Repositories
+** Points de publication des certificats et des informations de révocation.
+** CRL (Certificate Revocation List).
+** OCSP (Online Certificate Status Protocol).
+
+=== Chaîne de confiance
+
+Un certificat est validé en reconstituant une chaîne de confiance :
+
+. Le navigateur reçoit le **Leaf certificate** (site).
+. Il vérifie la signature avec l’**Intermediate CA**.
+. L’intermediate est lui-même signé par le **Root CA**.
+. Le Root CA doit être présent dans le **trust store** local.
+. Si toute la chaîne est valide, la connexion est approuvée.
+
+[NOTE]
+--
+Le serveur envoie toujours le Leaf et les Intermediate nécessaires.
+Le Root CA n’est jamais envoyé : il doit être présent côté client.
+--
+
+=== Commandes de base OpenSSL
+
+[source,bash]
+----
+# Voir le contenu d’un certificat
+openssl x509 -in cert.pem -text -noout
+
+# Vérifier qu’un certificat est signé par une CA donnée
+openssl verify -CAfile chain.pem cert.pem
+
+# Générer une clé privée RSA 2048 bits
+openssl genrsa -out privkey.pem 2048
+
+# Générer une CSR (Certificate Signing Request) à partir d’une clé privée
+openssl req -new -key privkey.pem -out request.csr
+
+# Créer un certificat auto-signé (ex: Root CA)
+openssl req -x509 -new -nodes -key privkey.pem -sha256 -days 365 -out rootCA.pem
+----
+
+=== Chaîne complète vs certificats isolés
+
+* `cert.pem` : contient uniquement le certificat Leaf (site).
+* `chain.pem` : contient les certificats intermédiaires.
+* `fullchain.pem` : concaténation du Leaf + chain.pem → utilisé par la majorité des serveurs web.
+* Le Root n’est jamais inclus.
+
+=== Révocation et validation
+
+* **CRL (Certificate Revocation List)**
+** Liste signée par la CA contenant les certificats invalidés.
+** Téléchargée régulièrement par les clients.
+
+* **OCSP (Online Certificate Status Protocol)**
+** Protocole permettant de vérifier en temps réel la validité d’un certificat.
+** Réponse courte : "good", "revoked" ou "unknown".
+
+* **OCSP Stapling**
+** Optimisation TLS.
+** Le serveur fournit la réponse OCSP directement dans le handshake.
+** Évite au client de contacter le serveur OCSP lui-même.
+
+=== Sécurité et bonnes pratiques
+
+* Root CA doit rester hors ligne, seule l’Intermediate CA est utilisée pour signer.
+* Certificats serveurs avec durée de vie courte (90 jours chez Let’s Encrypt).
+* Renouvellement automatisé (certbot, acme.sh).
+* Utiliser OCSP Stapling pour accélérer la validation.
+* Ne jamais partager les clés privées.
+* Restreindre les usages des certificats via KeyUsage et ExtendedKeyUsage.
+
+== Cycle de vie d’un certificat
+
+Un certificat suit plusieurs étapes durant sa vie. Ces étapes sont gérées par la PKI.
+
+=== Création d’une clé privée
+
+[source,bash]
+----
+# Exemple RSA
+openssl genrsa -out server.key 2048
+
+# Exemple EC (Elliptic Curve)
+openssl ecparam -name prime256v1 -genkey -noout -out server.key
+----
+
+Cette clé privée doit rester secrète et ne jamais être partagée.
+
+=== 2. Création d’une CSR (Certificate Signing Request)
+
+[source,bash]
+----
+openssl req -new -key server.key -out server.csr
+----
+
+La CSR contient :
+
+* la clé publique,
+* les informations du Subject (CN, O, etc.),
+* éventuellement des extensions (SAN),
+* et est signée par la clé privée.
+
+=== 3. Signature par une CA
+
+La CSR est envoyée à une CA (publique comme Let's Encrypt, ou privée interne).
+La CA signe le certificat avec sa propre clé privée et retourne un certificat valide.
+
+=== 4. Distribution et installation
+
+Le certificat signé est installé sur le serveur/application.
+Souvent accompagné de `fullchain.pem` (leaf + intermediates).
+
+=== 5. Utilisation
+
+Le certificat est présenté par le serveur lors des connexions TLS/SSL.
+Le client le valide grâce à sa chaîne de confiance.
+
+=== 6. Renouvellement
+
+Avant expiration (`Not After`), le certificat doit être renouvelé.
+Les durées sont de plus en plus courtes (ex: 90 jours pour Let's Encrypt).
+Les outils comme `certbot` automatisent cette étape.
+
+=== 7. Révocation
+Si une clé privée est compromise ou si un certificat n’est plus valide, il peut être révoqué :
+* Ajouté à une CRL (Certificate Revocation List),
+* Ou signalé comme révoqué via OCSP.
+
+== Gestion des trust stores
+
+Un certificat Root CA doit être connu du client pour qu’une chaîne soit valide.
+Cela implique qu’il doit être stocké dans un **trust store**.
+
+=== 1. Qui ajoute un Root CA ?
+
+* **CA publiques reconnues** (ex: ISRG Root X1, DigiCert, GlobalSign…)
+** Ajoutées dans les OS/navigateurs par les éditeurs (Microsoft, Apple, Mozilla, distributions Linux).
+** Cela passe par un processus de validation (ex: Mozilla CA Certificate Policy).
+** Exemple : Let's Encrypt a dû prouver sa fiabilité pour que son Root CA soit intégré aux stores.
+
+* **CA privées** (internes à une organisation)
+** Ajoutées manuellement par un administrateur système ou devops.
+** Exemple : une entreprise crée un Root CA interne et le déploie via GPO (Windows) ou via un package Linux.
+
+=== 2. Où sont stockés les certificats ?
+
+* Linux
+** `/etc/ssl/certs` (Debian/Ubuntu).
+** `/etc/pki/ca-trust` (RedHat).
+** Commandes : `update-ca-certificates` ou `update-ca-trust`.
+** Les certificats Root sont généralement des fichiers `.crt` PEM.
+
+* Windows
+** Windows Certificate Store (géré via MMC).
+** Séparé en "Trusted Root Certification Authorities", "Intermediate", etc.
+** Déploiement via GPO dans un environnement Active Directory.
+
+* macOS
+** Utilise le **Keychain Access**.
+** Les certificats Root peuvent être installés manuellement ou via MDM.
+
+* Firefox
+** Maintient son propre trust store indépendant.
+** Les CA racines y sont ajoutées par Mozilla après audit.
+
+=== 3. Ajout manuel d’un certificat Root CA
+
+* Sous Linux
+[source,bash]
+----
+sudo cp myrootCA.crt /usr/local/share/ca-certificates/
+sudo update-ca-certificates
+----
+
+* Sous Windows
+[source,bash]
+----
+# Depuis MMC -> Ajouter un certificat -> Trusted Root Certification Authorities
+# Ou via PowerShell
+Import-Certificate -FilePath "C:\myrootCA.crt" -CertStoreLocation Cert:\LocalMachine\Root
+----
+
+* Sous Firefox
+** Ouvrir Paramètres → Vie privée et sécurité → Certificats → Autorités → Importer.
+
+[NOTE]
+--
+Les certificats Root CA sont rarement ajoutés par les utilisateurs.
+En pratique, seuls les éditeurs des OS/navigateurs ajoutent les Root publics.
+Les administrateurs ajoutent uniquement les CA internes lorsqu’ils déploient une PKI privée.
+--
+
+== Exemple complet de PKI interne
+
+Cette section illustre la création d’une PKI locale de test.
+Nous allons créer :
+
+* Une **Root CA** (hors ligne),
+* Une **Intermediate CA** (qui signe les certificats serveurs),
+* Un **certificat Leaf** (par ex. pour `myapp.local`).
+
+Enfin, nous verrons comment installer les certificats pour que la chaîne soit valide sur une machine cliente.
+
+=== 1. Préparer l’environnement
+
+[source,bash]
+----
+mkdir -p ~/pki/{root,intermediate,certs,private,newcerts,csr}
+chmod 700 ~/pki/private
+touch ~/pki/index.txt
+echo 1000 > ~/pki/serial
+----
+
+=== 2. Créer une Root CA
+
+[source,bash]
+----
+# Générer une clé privée pour la Root CA
+openssl genrsa -out root/rootCA.key 4096
+
+# Créer un certificat Root auto-signé (valide 10 ans)
+openssl req -x509 -new -nodes \
+  -key root/rootCA.key \
+  -sha256 -days 3650 \
+  -subj "/C=FR/ST=France/L=Paris/O=MyOrg/OU=IT/CN=MyRootCA" \
+  -out root/rootCA.crt
+----
+
+* `rootCA.key` → clé privée (secrète, hors ligne).
+* `rootCA.crt` → certificat racine, auto-signé.
+
+=== 3. Créer une Intermediate CA
+
+[source,bash]
+----
+# Générer une clé privée pour l’intermédiaire
+openssl genrsa -out intermediate/intermediateCA.key 4096
+
+# Créer une CSR (Certificate Signing Request) pour l’intermédiaire
+openssl req -new -sha256 \
+  -key intermediate/intermediateCA.key \
+  -subj "/C=FR/ST=France/L=Paris/O=MyOrg/OU=IT/CN=MyIntermediateCA" \
+  -out intermediate/intermediateCA.csr
+
+# Signer l’intermediate avec la Root CA
+openssl x509 -req -in intermediate/intermediateCA.csr \
+  -CA root/rootCA.crt -CAkey root/rootCA.key \
+  -CAcreateserial \
+  -out intermediate/intermediateCA.crt \
+  -days 1825 -sha256 \
+  -extfile <(printf "basicConstraints=CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n")
+----
+
+* `intermediateCA.key` → clé privée intermédiaire.
+* `intermediateCA.crt` → signé par le Root, utilisable pour signer les leaf.
+
+=== 4. Créer un certificat Leaf (serveur)
+
+[source,bash]
+----
+# Générer la clé privée du serveur
+openssl genrsa -out private/myapp.local.key 2048
+
+# Créer une CSR pour le serveur
+openssl req -new -sha256 \
+  -key private/myapp.local.key \
+  -subj "/C=FR/ST=France/L=Paris/O=MyOrg/OU=Apps/CN=myapp.local" \
+  -out csr/myapp.local.csr
+
+# Signer le certificat serveur avec l’Intermediate
+openssl x509 -req -in csr/myapp.local.csr \
+  -CA intermediate/intermediateCA.crt \
+  -CAkey intermediate/intermediateCA.key \
+  -CAcreateserial \
+  -out certs/myapp.local.crt \
+  -days 365 -sha256 \
+  -extfile <(printf "subjectAltName=DNS:myapp.local\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth")
+----
+
+* `myapp.local.key` → clé privée du serveur.
+* `myapp.local.crt` → certificat signé par l’intermédiaire.
+
+=== 5. Construire la chaîne complète
+
+Pour distribuer au serveur :
+[source,bash]
+----
+cat certs/myapp.local.crt intermediate/intermediateCA.crt > certs/fullchain.pem
+----
+
+* `fullchain.pem` = Leaf + Intermediate(s).
+* C’est ce que le serveur doit présenter aux clients.
+
+Le Root (`rootCA.crt`) **ne doit pas être sur le serveur** mais dans le trust store du client.
+
+=== 6. Installer les certificats côté client
+
+* Sous Linux
+[source,bash]
+----
+# Copier le Root CA dans le répertoire des certificats
+sudo cp root/rootCA.crt /usr/local/share/ca-certificates/myrootCA.crt
+
+# Mettre à jour le trust store
+sudo update-ca-certificates
+----
+
+* Sous Windows
+[source,powershell]
+----
+# Importer dans Trusted Root Certification Authorities
+Import-Certificate -FilePath "C:\path\to\rootCA.crt" -CertStoreLocation Cert:\LocalMachine\Root
+----
+
+* Sous Firefox
+Aller dans Paramètres → Vie privée et sécurité → Certificats → Autorités → Importer → `rootCA.crt`.
+
+=== 7. Vérification
+
+[source,bash]
+----
+# Vérifier la chaîne complète côté client
+openssl verify -CAfile root/rootCA.crt certs/fullchain.pem
+# Résultat attendu : OK
+----
+
+=== Résumé du flux sécurisé
+
+. Le serveur présente `fullchain.pem` (Leaf + Intermediate).
+. Le client valide la signature du Leaf avec l’Intermediate.
+. Le client valide la signature de l’Intermediate avec le Root CA stocké localement.
+. Si tout est cohérent, la chaîne est approuvée et la connexion TLS est établie.
+
