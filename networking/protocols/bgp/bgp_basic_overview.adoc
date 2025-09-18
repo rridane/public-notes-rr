@@ -1,0 +1,132 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+:keywords: BGP, Routage, Internet, AS, Autonomous System, eBGP, iBGP
+
+= Protocole BGP (Border Gateway Protocol)
+
+== 1. Définition et Rôle Principal
+
+BGP est le protocole de routage qui permet l'échange d'informations de routage et d'accessibilité entre *Systèmes Autonomes* (AS) différents sur Internet. C'est le procole qui permets le routage sur tout internet.
+
+* *Type* : Protocole de routage *Path Vector* (Vecteur de chemin). (Vecteur de "nom d'AS" en réalité)
+* *Transport* : S'appuie sur *TCP* (port `179`). Cette couche gère la fiabilité, BGP n'a pas à le faire.
+* *Granularité* : Échange des *préfixes IP* (ex: `192.0.2.0/24`) accompagnés d'*attributs*.
+
+== 2. Concepts Fondamentaux
+
+=== a) Autonomous System (AS)
+
+Un AS est un ensemble de réseaux IP et de routeurs sous la même administration technique et qui partage une *politique de routage unique*.
+
+* Exemples : Un FAI (Orange, AS3215), un hébergeur (OVH, AS16276), une grande entreprise.
+* Identifié par un numéro unique : *ASN* (Autonomous System Number).
+
+=== b) eBGP vs. iBGP
+
+* *eBGP (External BGP)* : Session BGP établie entre deux routeurs appartenant à *deux AS différents*. C'est le mécanisme principal d'échange de routes sur Internet.
+* *iBGP (Internal BGP)* : Session BGP établie entre deux routeurs *dans le même AS*. Son but est de propager les routes apprises via eBGP à tous les routeurs bordure de l'AS. Nécessite une architecture full-mesh ou l'utilisation de *Route Reflectors*.
+
+== 3. Fonctionnement Détaillé
+
+=== a) Établissement de Session : Ce n'est pas magique !
+
+Contrairement à OSPF (qui utilise du multicast pour découvrir ses voisins, et donc envoie des "flooed"), les pairs BGP sont *configurés manuellement*.
+
+* **Configuration Explicite** : Sur chaque routeur, on déclare l'adresse IP et l'ASN du voisin.
+
+[source,cisco]
+----
+# On déclare l'AS 65001 sur le routeur en question, et son voisin est 192.0.2.2, son id est 65002
+# Voilà comment il sait à qui envoyer un message OPEN
+! Configuration sur le routeur de l'AS 65001
+router bgp 65001
+  neighbor 192.0.2.2 remote-as 65002 # << IP du voisin et son ASN
+----
++
+* **Pré-requis IP** : Une connectivité IP directe (ou via un réseau L2) doit déjà exister entre les deux adresses IP configurées. Sans cela, la connexion TCP ne peut s'établir.
+* **Établissement** :
+1. Connexion TCP sur le port `179` initiée vers le voisin configuré.
+2. Échange de messages `OPEN` (paramètres de session).
+3. Échange de messages `KEEPALIVE` pour maintenir la session active.
+
+=== b) Échange et Propagation des Routes
+
+* **Annonce/Retrait** : Les routes sont échangées via des messages `UPDATE`. Ils contiennent :
+* Un ou plusieurs préfixes à annoncer.
+* Une liste d'*attributs* BGP pour ces préfixes.
+* Ou une liste de préfixes à *retirer* du routage (route withdrawal).
+* **Propagation Contrôlée** : La propagation n'est *pas un flood*. Chaque AS applique des *politiques* (filtres) pour décider quelles routes annoncer à quel voisin. Un FAI n'annoncera pas toutes les routes de ses pairs à ses clients, par exemple.
+* Concrètement, un AS peut décider de transférer un UPDATE à son voisin, lui transmettant ainsi un "vecteur" de "chemin AS" pour atteindre un réseau. Par ex:
+
+.AS 65001 annonce à AS 65002 qu'il peut le contacter pour le réseau 203.0.113.0/24
+[source,bash]
+----
+203.0.113.0/24  AS_PATH: 65001
+----
+
+.AS 65002 relaie le chemin vers le réseau 203.0.113.0/24, passant donc par lui puis par le 65001, voisin du 65002, il décrit ainsi un vecteur de 2 hops
+[source,bash]
+----
+203.0.113.0/24  AS_PATH: 65002 65001
+----
+
+=== c) Les Attributs BGP Clés
+
+Un préfixe seul ne suffit pas. Les attributs permettent de prendre des décisions de routage.
+
+* *AS_PATH* : Liste ordonnée des ASN traversés. C'est l'attribut principal.
+* **Fonction 1** : Éviter les boucles de routage. Si un routeur voit son propre ASN dans l'AS_PATH, il rejette la route.
+* **Fonction 2** : Servir de métrique de choix. Un chemin avec un AS_PATH plus court est généralement préféré.
+* *NEXT_HOP* : Adresse IP du prochain saut (routeur) pour atteindre le préfixe.
+* *LOCAL_PREF* (Local Preference) : Attribut utilisé *au sein d'un AS* pour définir la préférence de sortie. Un chemin avec une LOCAL_PREF plus haute est toujours préféré.
+* *MED* (Multi-Exit Discriminator) : "Suggestion" faite à un AS voisin pour lui indiquer quelle entrée privilégier pour revenir dans votre AS.
+
+=== d) Processus de Sélection du Meilleur Chemin
+
+Quand un routeur BGP apprend plusieurs chemins pour le même préfixe, il les compare en suivant un ordre strict :
+
+. Plus haute `LOCAL_PREF` (décision locale)
+. Plus court `AS_PATH`
+. Origine la plus basse (`IGP` < `EGP` < `INCOMPLETE`)
+. Plus bas `MED`
+. ... et ainsi de suite jusqu'à départager avec le plus bas Router ID.
+
+== Autres informations importantes
+
+=== Longueur max de l'AS_PATH
+
+* La longueur de l'AS_PATH est limitée à 255 ASN, mais sur Internet, elle dépasse rarement 10-15 sauts. Un chemin trop long sera considéré comme non optimal et ignoré par les politiques de routage.
+
+=== Tous les routeurs parlent-ils BGP
+
+* **NON.** Seuls les routeurs qui ont besoin d'échanger des routes avec d'autres AS exécutent BGP.
+* *Routeurs BGP* : Routeurs de bordure des FAI, des grands hébergeurs, des entreprises multi-hômées.
+* *Routeurs non-BGP* : Routeurs domestiques (Box Internet), switchs L2, routeurs cœur de réseau d'un AS (ils utilisent OSPF/IS-IS en interne). Ils transportent les paquets BGP sans les interpréter.
+
+=== Comment les paquets BGP circulent-ils concrètement ?
+
+Les messages BGP sont encapsulés dans une connexion TCP, elle-même dans des paquets IP. Ils sont *routés* comme n'importe quel autre trafic.
+
+* **Pour les équipements intermédiaires (switchs L2, routeurs sans BGP)** :
+* Ils voient un flux TCP standard sur le port `179`.
+* Ils forwardent les trames Ethernet / paquets IP sans comprendre le contenu BGP.
+* Le protocole BGP leur est *transparent*.
++
+[frame]
+----
+[ En-tête Ethernet ] [ En-tête IP ] [ En-tête TCP (port 179) ] [ Message BGP (OPEN/KEEPALIVE/UPDATE) ]
+----
+
+* **Seuls les deux routeurs BGP peers** terminent la connexion TCP et interprètent le message BGP.
+
+== 6. Résumé des Points Clés
+
+* **Pas de découverte automatique** : Les pairs BGP sont configurés manuellement.
+* **Pas de broadcast/flood** : Communication point-à-point via TCP.
+* **Politiques over métriques** : La décision de routage est basée sur des attributs et des politiques configurées, pas sur une simple métrique like "nombre de sauts".
+* **Colonne vertébrale d'Internet** : Tous les préfixes routables globaux sont annoncés via BGP.
+* **Convergence lente, mais extrêmement scalable** : conçu pour la stabilité d'Internet, pas pour la vitesse.
