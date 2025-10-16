@@ -1,0 +1,872 @@
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+
+= Gesture Handling
+
+== InitInstance du GestureBinding
+
+La gestureBinding déclare le pont entre le platformDispatcher et le flutter framework via _handlePointerDataPacker;
+
+.initInstancte qui déclare le point d'entrée du GestureBinding
+[source, dart]
+----
+  void initInstances() {
+    super.initInstances();
+    _instance = this;
+    platformDispatcher.onPointerDataPacket = _handlePointerDataPacket;
+  }
+
+----
+
+_handlePointerDataPacker appelle _flushPointerQueue
+
+._handlPointerDataPacker
+[source, dart]
+----
+  void _handlePointerDataPacket(ui.PointerDataPacket packet) {
+    // We convert pointer data to logical pixels so that e.g. the touch slop can be
+    // defined in a device-independent manner.
+    try {
+      _pendingPointerEvents.addAll(PointerEventConverter.expand(packet.data, _devicePixelRatioForView));
+      if (!locked) {
+        _flushPointerEventQueue();
+      }
+    } catch (error, stack) {
+      FlutterError.reportError(FlutterErrorDetails(
+        exception: error,
+        stack: stack,
+        library: 'gestures library',
+        context: ErrorDescription('while handling a pointer data packet'),
+      ));
+    }
+  }
+----
+
+_flushPointerEventQueue appelle handlePointerEvent
+
+._flushPointerEventQueue
+[source, dart]
+----
+  void _flushPointerEventQueue() {
+    assert(!locked);
+
+    while (_pendingPointerEvents.isNotEmpty) {
+      handlePointerEvent(_pendingPointerEvents.removeFirst());
+    }
+  }
+----
+
+handlePointerEventQueue appelle _handlePointerEventImmediately qui est le point d'entrée du traitement, c'est à partir de la que le hitTest commence
+
+.handlePointEvent
+[source, dart]
+----
+  void handlePointerEvent(PointerEvent event) {
+    assert(!locked);
+
+    if (resamplingEnabled) {
+      _resampler.addOrDispatch(event);
+      _resampler.sample(samplingOffset, samplingClock);
+      return;
+    }
+
+    // Stop resampler if resampling is not enabled. This is a no-op if
+    // resampling was never enabled.
+    _resampler.stop();
+    _handlePointerEventImmediately(event);
+  }
+----
+
+.handlePointerEventQueue
+[source, dart]
+----
+  void _handlePointerEventImmediately(PointerEvent event) {
+    HitTestResult? hitTestResult;
+    if (event is PointerDownEvent || event is PointerSignalEvent || event is PointerHoverEvent || event is PointerPanZoomStartEvent) {
+      assert(!_hitTests.containsKey(event.pointer), 'Pointer of ${event.toString(minLevel: DiagnosticLevel.debug)} unexpectedly has a HitTestResult associated with it.');
+      hitTestResult = HitTestResult();
+      hitTestInView(hitTestResult, event.position, event.viewId);
+      if (event is PointerDownEvent || event is PointerPanZoomStartEvent) {
+        _hitTests[event.pointer] = hitTestResult;
+      }
+      assert(() {
+        if (debugPrintHitTestResults) {
+          debugPrint('${event.toString(minLevel: DiagnosticLevel.debug)}: $hitTestResult');
+        }
+        return true;
+      }());
+    } else if (event is PointerUpEvent || event is PointerCancelEvent || event is PointerPanZoomEndEvent) {
+      hitTestResult = _hitTests.remove(event.pointer);
+    } else if (event.down || event is PointerPanZoomUpdateEvent) {
+      // Because events that occur with the pointer down (like
+      // [PointerMoveEvent]s) should be dispatched to the same place that their
+      // initial PointerDownEvent was, we want to re-use the path we found when
+      // the pointer went down, rather than do hit detection each time we get
+      // such an event.
+      hitTestResult = _hitTests[event.pointer];
+    }
+    assert(() {
+      if (debugPrintMouseHoverEvents && event is PointerHoverEvent) {
+        debugPrint('$event');
+      }
+      return true;
+    }());
+    if (hitTestResult != null ||
+        event is PointerAddedEvent ||
+        event is PointerRemovedEvent) {
+      dispatchEvent(event, hitTestResult);
+    }
+  }
+  
+  
+  /// Determine which [HitTestTarget] objects are located at a given position in
+  /// the specified view.
+  @override // from HitTestable
+  void hitTestInView(HitTestResult result, Offset position, int viewId) {
+    result.add(HitTestEntry(this));
+  }
+----
+
+
+Or RendererBinding surcharge GestureBinding, il surcharge plus précisément la méthode qui nous intéresse tout particulièrement, hitTestInView.
+
+.surcharge de GestureBinding
+[source, dart]
+----
+mixin RendererBinding on BindingBase, ServicesBinding, SchedulerBinding, GestureBinding, SemanticsBinding, HitTestable {
+----
+
+.hitTestInView dans le renderer
+[source, dart]
+----
+  @override
+  void hitTestInView(HitTestResult result, Offset position, int viewId) {
+    _viewIdToRenderView[viewId]?.hitTest(result, position: position);
+    super.hitTestInView(result, position, viewId);
+  }
+----
+
+C'est ici que la séquence des hitTest est lancée.
+
+_viewIdToRenderView est une map de viewId, renderView. Nous appelons donc la méthode hitTest pour la renderView associée.
+
+Celle ci initie la séquence de hitTest.
+
+.initialisation de la séquence des hitTest
+[source, dart]
+----
+  bool hitTest(HitTestResult result, { required Offset position }) {
+    if (child != null) {
+      child!.hitTest(BoxHitTestResult.wrap(result), position: position);
+    }
+    result.add(HitTestEntry(this));
+    return true;
+  }
+----
+
+La séquence des hitTest est alors appelée de manière récursive par chaque renderObject, voici par exemple l'implémentation du defautlHitTestChildren dans l'univers des box (vs slivers)
+
+La classe Box implémente la méthode hitTest, qui appelle hitTestChildren
+
+.hitTest -> hitTestChildren
+[source, dart]
+----
+  bool hitTest(BoxHitTestResult result, { required Offset position }) {
+    assert(() {
+      if (!hasSize) {
+        if (debugNeedsLayout) {
+          throw FlutterError.fromParts(<DiagnosticsNode>[
+            ErrorSummary('Cannot hit test a render box that has never been laid out.'),
+            describeForError('The hitTest() method was called on this RenderBox'),
+            ErrorDescription(
+              "Unfortunately, this object's geometry is not known at this time, "
+              'probably because it has never been laid out. '
+              'This means it cannot be accurately hit-tested.',
+            ),
+            ErrorHint(
+              'If you are trying '
+              'to perform a hit test during the layout phase itself, make sure '
+              "you only hit test nodes that have completed layout (e.g. the node's "
+              'children, after their layout() method has been called).',
+            ),
+          ]);
+        }
+        throw FlutterError.fromParts(<DiagnosticsNode>[
+          ErrorSummary('Cannot hit test a render box with no size.'),
+          describeForError('The hitTest() method was called on this RenderBox'),
+          ErrorDescription(
+            'Although this node is not marked as needing layout, '
+            'its size is not set.',
+          ),
+          ErrorHint(
+            'A RenderBox object must have an '
+            'explicit size before it can be hit-tested. Make sure '
+            'that the RenderBox in question sets its size during layout.',
+          ),
+        ]);
+      }
+      return true;
+    }());
+    if (_size!.contains(position)) {
+      if (hitTestChildren(result, position: position) || hitTestSelf(position)) {
+        result.add(BoxHitTestEntry(this, position));
+        return true;
+      }
+    }
+    return false;
+  }
+
+----
+
+.defaultHitTestChildren
+[source, dart]
+----
+  bool defaultHitTestChildren(BoxHitTestResult result, { required Offset position }) {
+    ChildType? child = lastChild;
+    while (child != null) {
+      // The x, y parameters have the top left of the node's box as the origin.
+      final ParentDataType childParentData = child.parentData! as ParentDataType;
+      final bool isHit = result.addWithPaintOffset(
+        offset: childParentData.offset,
+        position: position,
+        hitTest: (BoxHitTestResult result, Offset transformed) {
+          assert(transformed == position - childParentData.offset);
+          return child!.hitTest(result, position: transformed);
+        },
+      );
+      if (isHit) {
+        return true;
+      }
+      child = childParentData.previousSibling;
+    }
+    return false;
+  }
+
+----
+
+A l'issue de ce processus, _handlePointerEventImmediately dispose d'un hitTestResult complet, liste de hitTestEntry.
+
+Il appelle dispatchEvent pour ce result.
+
+.dispatchEvent
+[source, dart]
+----
+      dispatchEvent(event, hitTestResult);
+----
+
+dispatchEvent appelle alors handleEvent sur chaque renderObject afin qu'il procède à l'update de leur widgets. On notera par ailleurs que si le hitTestResult est null et si l'event est de type PointerAddedEvent ou PointerRemoveEvent, il tentera d'appeler la méthode route sur les pointerRouter. Les pointerRouter sont un moyen de se brancher directement sur le platformDispatcher sans passer par la gestureArena.
+
+NOTE: Cette méthode est centrale comme nous le verrons par la suite, car c'est également ici que dans un premier temps sont dispatchées les mises à jour vers les gestureRecognizers qui écoutent les évènements relatifs à un pointer, donc les processus en cours de la gestureArena.
+
+.dispatchEvent & handleEvent
+[source, dart]
+----
+  @override // from HitTestDispatcher
+  @pragma('vm:notify-debugger-on-exception')
+  void dispatchEvent(PointerEvent event, HitTestResult? hitTestResult) {
+    assert(!locked);
+    // No hit test information implies that this is a [PointerAddedEvent] or
+    // [PointerRemovedEvent]. These events are specially routed here; other
+    // events will be routed through the `handleEvent` below.
+    if (hitTestResult == null) {
+      assert(event is PointerAddedEvent || event is PointerRemovedEvent);
+      try {
+        pointerRouter.route(event);
+      } catch (exception, stack) {
+        FlutterError.reportError(FlutterErrorDetailsForPointerEventDispatcher(
+          exception: exception,
+          stack: stack,
+          library: 'gesture library',
+          context: ErrorDescription('while dispatching a non-hit-tested pointer event'),
+          event: event,
+          informationCollector: () => <DiagnosticsNode>[
+            DiagnosticsProperty<PointerEvent>('Event', event, style: DiagnosticsTreeStyle.errorProperty),
+          ],
+        ));
+      }
+      return;
+    }
+    for (final HitTestEntry entry in hitTestResult.path) {
+      try {
+        entry.target.handleEvent(event.transformed(entry.transform), entry);
+      } catch (exception, stack) {
+        FlutterError.reportError(FlutterErrorDetailsForPointerEventDispatcher(
+          exception: exception,
+          stack: stack,
+          library: 'gesture library',
+          context: ErrorDescription('while dispatching a pointer event'),
+          event: event,
+          hitTestEntry: entry,
+          informationCollector: () => <DiagnosticsNode>[
+            DiagnosticsProperty<PointerEvent>('Event', event, style: DiagnosticsTreeStyle.errorProperty),
+            DiagnosticsProperty<HitTestTarget>('Target', entry.target, style: DiagnosticsTreeStyle.errorProperty),
+          ],
+        ));
+      }
+    }
+  }
+
+----
+
+.exemple de handleEvent
+[source, dart]
+----
+  @override
+  void handleEvent(PointerEvent event, covariant BoxHitTestEntry entry) {
+    /// Voir pourquoi mais flutter conseille de l'appeler dans la méthode source handle
+    /// Il semble que cela permette de supporter debugPaintPointersEnabled
+    assert(debugHandleEvent(event, entry));
+
+    if (event is PointerDownEvent) {
+      _tapGestureRecognizer.addPointer(event);
+    }
+  }
+----
+
+Donc handleEvent a pour vocation à ajouter le pointer au gestureRecognizer
+
+.Exemple de PointerRouter
+[source, dart]
+----
+class MyGestureHandler {
+  void handleSingleFingerTap(PointerEvent event) {
+    print("Single finger tap detected");
+  }
+
+  void handleTwoFingerTap(PointerEvent event) {
+    print("Two finger tap detected");
+  }
+
+  void setupPointerRouter(PointerRouter router) {
+    // Enregistrer un callback global pour tous les taps
+    router.addGlobalRoute(handleSingleFingerTap);
+
+    // Supposons que l'identifiant de pointeur 2 correspond à un deuxième doigt sur l'écran
+    router.addRoute(2, handleTwoFingerTap);
+  }
+}
+----
+
+== La gesture Arena et la gestion des évènements
+
+=== Classe
+
+La gesture Arena Member est une classe abstraite qui contient deux méthodes, qui établissent un contrat précisant qu'un évènement peut soit être refusé soit accepté.
+
+.gestureArenaMember
+[source, dart]
+----
+abstract class GestureArenaMember {
+  /// Called when this member wins the arena for the given pointer id.
+  void acceptGesture(int pointer);
+
+  /// Called when this member loses the arena for the given pointer id.
+  void rejectGesture(int pointer);
+}
+----
+
+Les gesturesRecognize hérite de cette classe, ils sont donc membres de la gestion Arena.
+
+=== Recognizer et gestureArena
+
+La gestureArena est un mécanisme d'attente qui mets en jeu plusieurs recognizers qui revendiquent la propriété d'un event. La méthode addAllowedPointer est le point d'entrée, c'est ici que l'on précise le type d'évènements que l'on souhaite écouter. Lorsqu'un évènnement arrive, il nous appartient d'enregistrer le recognizer comme un candidat potentiel à la victoire par la méthode add.
+
+.ajouter le recognizer à la gestureArena
+[source, dart]
+----
+GestureBinding.instance.gestureArena.add(event.pointer, this)
+----
+
+Il nous appartient également de tracker ce pointeur pour en connaitre l'issue
+
+.ajouter notre méthode handleEvent afin de tracker, et de décider suite à une mise à jour de l'évènements en cours
+[source, dart]
+----
+GestureBinding.instance.pointerRouter.addRoute(event.pointer, handleEvent);
+----
+
+Il nous appartient entre le début et la fin de procéder à différentes opérations, notamment pour beaucoup de gestes, tracker le temps entre le premier évènement du pointer, et le second.
+
+Au cours du processus de la gestureArena, il est possible d'intervenir pour :
+
+faire patienter la gesture arena et lui indiquer que nous sommes toujours en attente
+
+.faire patienter la gestureArena
+[source, dart]
+----
+GestureBinding.instance.gestureArena.hold(tracker.pointer)
+----
+
+Mettre un terme à la demande d'attente
+
+.mettre un terme à la demande d'attente
+[source, dart]
+----
+GestureBinding.instance.gestureArena.release(tracker.pointer)
+----
+
+Et en fin préciser à la gestureArena que l'évènement est soit accepté soit rejeté
+
+.accept or reject
+[source, dart]
+----
+GestureBinding.instance.gestureArena.resolve(GestureDisposition.accepted)
+GestureBinding.instance.gestureArena.resolve(GestureDisposition.rejected)
+----
+
+A l'issue du processus, la gestureArena dispose en général d'un vainqueur, elle procède un processus de disambuguition en cas de doute
+
+=== Exemple
+
+.implémentation d'un TripleTap
+[source, dart]
+----
+import 'dart:async';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+
+class TripleTapGestureRecognizer extends GestureRecognizer {
+
+  TripleTapGestureRecognizer({this.onTripleTap});
+
+  final VoidCallback? onTripleTap;
+
+  int _tapCount = 0;
+  Timer? _timer;
+
+  // Gère l'ajout d'un nouveau pointeur
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    GestureBinding.instance.pointerRouter.addRoute(event.pointer, handleEvent);
+    GestureBinding.instance.gestureArena.add(event.pointer, this);
+    _checkTap(event.pointer);
+  }
+
+  // Vérifie le nombre de taps et gère les timers
+  void _checkTap(int pointer) {
+    _tapCount++;
+    _timer?.cancel();
+    if (_tapCount == 3) {
+      // Accepter l'évènement dans la gestureArena, et se déclarer comme vainqueur potentiel
+      GestureBinding.instance.gestureArena.resolve(pointer, GestureDisposition.accepted);
+      GestureBinding.instance.pointerRouter.removeRoute(pointer, handleEvent);
+      _reset(pointer);
+    } else {
+      if (_tapCount == 2) {
+        GestureBinding.instance.gestureArena.hold(pointer);
+      }
+      _timer = Timer(const Duration(milliseconds: 500), () => _reset(pointer));
+    }
+  }
+
+  // Gère les événements de pointeur
+  // Un pointerUp définit forcément la fin du traçage d'un pointer, il s'agit d'un optimisatoin (de même pour PointerCancelEvent)
+  @override
+  void handleEvent(PointerEvent event) {
+    if (event is PointerUpEvent || event is PointerCancelEvent) {
+      GestureBinding.instance.pointerRouter.removeRoute(event.pointer, handleEvent);
+      GestureBinding.instance.gestureArena.resolve(event.pointer, GestureDisposition.rejected);
+    }
+  }
+
+  // Réinitialise l'état du recognizer
+  void _reset(int pointer) {
+    _tapCount = 0;
+    _timer?.cancel();
+    _timer = null;
+    GestureBinding.instance.pointerRouter.removeRoute(pointer, handleEvent);
+    GestureBinding.instance.gestureArena.resolve(pointer, GestureDisposition.rejected);
+  }
+
+  @override
+  void didStopTrackingLastPointer(int pointer) {}
+
+  @override
+  void acceptGesture(int pointer) {
+      // en cas de victoire appelée la méthode onTripleTap déclarée à un niveau plus haut (dans le GestureDetector ou dans le rawGestureDetector)
+      onTripleTap?.call();
+  }
+
+  @override
+  void rejectGesture(int pointer) {}
+
+  @override
+  String get debugDescription => 'triple tap';
+}
+----
+
+=== Utiliser le recognizer dans un widget qui utilise le RawGestureDetector
+
+.connexion au widget avec rawGestureDetector
+[source, dart]
+----
+import 'package:flutter/material.dart';
+
+class TripleTapTestWidget extends StatefulWidget {
+  @override
+  _TripleTapTestWidgetState createState() => _TripleTapTestWidgetState();
+}
+
+class _TripleTapTestWidgetState extends State<TripleTapTestWidget> {
+  String _status = "Pas encore triplement tapé";
+
+  @override
+  Widget build(BuildContext context) {
+    return RawGestureDetector(
+      gestures: {
+        TripleTapGestureRecognizer: GestureRecognizerFactoryWithHandlers<TripleTapGestureRecognizer>(
+          () => TripleTapGestureRecognizer(),  // Constructeur
+          (TripleTapGestureRecognizer instance) {
+            instance
+              ..onTripleTap = () {
+                setState(() {
+                  _status = "Triplement tapé!";
+                });
+              };
+          },
+        ),
+      },
+      child: Center(
+        child: Container(
+          padding: EdgeInsets.all(16.0),
+          color: Colors.blue[200],
+          child: Text(_status),
+        ),
+      ),
+    );
+  }
+}
+----
+
+== Fonctionnement macro
+
+La base est le GestureDetector, mais le sujet sont les custom gestures.
+
+En descendant d'un niveau on peut utiliser le RawGestureDetector qui est utilisée par le gestureDetector. Il utilise une interface, la GestureRecognizer.
+
+https://api.flutter.dev/flutter/gestures/GestureRecognizer-class.html
+
+Il y a plusieurs gestures recognizer qui implémente cette interface :
+
+* TapGestureRecognizer
+* DoubleTapGestureRecognizer
+* LongPressGestureRecognizer
+* HorizontalDragGestureRecognizer
+* VerticalDragGestureRecognizer
+* PanGestureRecognizer
+* ScaleGestureRecognizer
+
+Le sujet est maintenant comment faire notre propre gesture recognizer. Il faut comprendre le flow de detection. On commence par les concepts.
+
+== Pointers & Events
+
+Les pointers, c'est quand on touche l'écran, on a donc un pointer quand on touche avec un doigt, et deux pointers quand on touche avec deux doigts. Tant que le doigt est sur l'écran, le pointer reste le même, si on enlève le doigt et qu'on reclique, on a un autre pointer associé au nouveau click.
+
+Chaque pointer a des events:
+
+* PointerAddedEvent
+* PointerDownEvent
+* PointerMoveEvent
+* PointerUpEvent
+* PointerRemoveEvent
+
+Supposons que l'on touche l'écran, alors:
+
+* Le pointerEvent sera traité par le PlatformDispatcher (Point d'entrée pour les events relatif à la platform)
+* Une mixin écoute le PlatformDispatcher, c'est la mixin GestureBinding et notamment sa méthode handlePointerEvent (Utilisée par le WidgetFlutterBinding, à vérifier, qui est au plus haut de notre application)
+* Cette méthode, handlePointerEvent va procéder à plusieurs opérations, on fait un zoom dessus:
+** hitTest: Quel est le widget qui est concerné par le pointerEvent ? L'idée est principalement de parcourir le renderTree (via le RenderBinding) et de demander à tous les widgets si ils sont concernés pas la zone de click. Il ajoute tous les widgets concernés à une liste de hitResults. Il suppose qu'on en a 3, donc 3 widgets potentiellement peuvent traiter ces gestures.
+** dispatchEvent: Chaque widget concerné est alors invité à appeler la méthode handleEvent, si ils l'implémentent. (Ce handleEvent est implémenté par la HitTestTarget Interface)
+* RenderPointerListener: Le RenderPointerListener aura alors connaissance de l'event qui a été dispatché. Et ce listener est en réalité implémenté sur le rawGestureDetector.
+=> Voilà comment le rawGestureDetector
+* GestureRecognizer: Le rawGestureDetector utilise un GestureRecognizer, qui a une liste de recognizer qui vont utiliser ces events pour décider du bon gesture.
+* Une dernière étape est que le gestureRecognizer doit alors s'enregister pour écouter tous les events relatifs à ce pointer, cela est fait via le PointerRouter, et notamment la méthode addRoute
+
+Schéma ici :https://www.youtube.com/watch?v=zEoASR7DTIw&t=265s
+
+En synthèse (en haut à droite dans les schéma):
+
+A chaque début de hit:
+
+* Propager le HitTest pour savoir qui est concerné
+* Dispatch l'event sur les concernés
+* Enregistrer les pointer events routes (associés au widget concernés et à l'écoute)
+* A chaque nouvel event il appelle les routes enregistrées pour que les recognizers traitent les nouveaux events
+
+== Créer un custom Gesture recognizer (non recommandé il vaut mieux hériter d'un gesture existant)
+
+.il faut implémenter ces méthodes
+[source, dart]
+----
+
+class CustomGestureRecognizer extends GestureRecognizer {
+
+  // Notre callback personnelle pour que notre application soit au courant du gesture
+  void Function(CustomGestureDetails details)? onCustomGestureDetected;
+
+  // permets d'enregister le gesture recognizer pour qu'il écouter tous les autres events
+  @override
+  void addAllowedPointer(PointerEvent event) {
+    GestureBinding.instance.pointerRouter.addRoute(
+      event.pointer, _handleEvent, event.transform
+    );
+  }
+
+  void _handleEvent(PointerEvent event) {
+     if (event is PointerDownEvent) {
+       // handle PointerDownEvent
+     } else if (...) {
+       // or handler any other pointer event as you need here
+     } else if (event is PointerUpEvent) {
+       onCustomGestureDetected?.call(event);
+     }
+
+  }
+
+  @override
+  void acceptGesture(int pointer) {}
+  @override
+  void rejectGesture(int pointer) {}
+  @override
+  String get debugDescription() => 'Custom gesture';
+
+}
+
+----
+
+Avec le code précédent on a la base, on peut alors le passer au RawGestureDetector:
+
+.rawGestureDetector qui utilise le CustomGestureRecognizer
+[source, dart]
+----
+...
+return RawGestureRecognizer(
+  gestures: {
+       CustomGestureRecognizer: GestureRecognizerFactoryWithHandlers<CustomGestureRecognizer>(
+          () => CustomGestureRecognizer(),
+          (CustomGestureRecognizer instance) {
+            instance.onCustomGestureDetected = ( CustomGestureDetails details )  {
+              // Do stuff to handle custom gesture here
+            }
+          }
+        )
+    }
+)
+
+----
+
+Il nous donne deux exemples, un customTripleTap, un customRotationTap. Le customRotation (RotationGestureRecognizer) provient d'un article que l'on peut consulter
+
+Ici : https://www.kodeco.com/29002200-creating-custom-gestures-in-flutter#toc-anchor-001
+
+== Multi target
+
+Que se passe t'il lorsque l'on a plusieurs targets possibles (plusieurs render objects qui répondent au hit test)
+
+Il y a plusieurs hit test behaviours. Trois questions doivent être posées pour connaitre le hit test behaviour:
+
+.Comprendre les hit test behaviour
+|===
+|Question|deferToChild|translucent|opaque
+|Dois je passer le hit test à mes childrens ?|yes|yes|yes
+|Dois m'ajouter à la liste des widget qui ont été hit ?|demande à l'enfant|yes|yes
+|Dois je dire à mon parent que je considère que le hit test m'a  hit ou l'un de mes enfants ?|demande à l'enfant|demande à l'enfant|yes
+|===
+
+Le comportement du hit test dans Flutter détermine comment un événement tactile est traité lorsque plusieurs widgets sont superposés ou imbriqués. Les trois modes de `HitTestBehavior` sont `deferToChild`, `translucent`, et `opaque`. Chacun a des implications différentes sur la manière dont les événements sont distribués dans l'arbre des widgets.
+
+=== 1. `deferToChild`
+*Dois-je passer le hit test à mes enfants ?* Oui. Le widget transmet l'événement aux enfants.
+*Dois-je m'ajouter à la liste des widgets qui ont été hit ?* Seulement si aucun enfant ne répond au hit test.
+*Dois-je dire à mon parent que je considère que le hit test m'a hit ou l'un de mes enfants ?* Cela dépend du résultat des enfants. Si un enfant répond positivement au hit test, alors oui.
+
+[source,dart]
+----
+GestureDetector(
+  behavior: HitTestBehavior.deferToChild,
+  onTap: () => print("Tap!"),
+  child: Container(
+    color: Colors.blue,
+    height: 100,
+    width: 100,
+    child: Center(
+      child: Container(
+        color: Colors.red,
+        height: 50,
+        width: 50,
+      ),
+    ),
+  ),
+)
+----
+Ici, si vous tapez sur le conteneur rouge (l'enfant), il recevra l'événement. Si vous tapez sur le bleu mais en dehors du rouge, rien ne se passera sauf si l'enfant rouge n'a pas de gestionnaire d'événements.
+
+=== 2. `translucent`
+
+*Dois-je passer le hit test à mes enfants ?* Oui.
+*Dois-je m'ajouter à la liste des widgets qui ont été hit ?* Oui, indépendamment de si les enfants répondent ou non.
+*Dois-je dire à mon parent que je considère que le hit test m'a hit ou l'un de mes enfants ?* Cela dépend des enfants, tout comme avec `deferToChild`.
+
+[source,dart]
+----
+GestureDetector(
+  behavior: HitTestBehavior.translucent,
+  onTap: () => print("Tap!"),
+  child: Container(
+    color: Colors.transparent,
+    height: 100,
+    width: 100,
+    child: Align(
+      alignment: Alignment.topLeft,
+      child: Container(
+        color: Colors.green,
+        height: 50,
+        width: 50,
+      ),
+    ),
+  ),
+)
+----
+Dans ce cas, même si le conteneur est transparent et que vous tapez n'importe où dans le conteneur parent, `Tap!` sera imprimé, car il s'ajoute toujours à la liste des hits.
+
+=== 3. `opaque`
+
+*Dois-je passer le hit test à mes enfants ?* Oui.
+*Dois-je m'ajouter à la liste des widgets qui ont été hit ?* Oui.
+*Dois-je dire à mon parent que je considère que le hit test m'a hit ou l'un de mes enfants ?* Oui, toujours.
+
+[source,dart]
+----
+GestureDetector(
+  behavior: HitTestBehavior.opaque,
+  onTap: () => print("Tap!"),
+  child: Container(
+    color: Colors.transparent,
+    height: 100,
+    width: 100,
+    child: Align(
+      alignment: Alignment.bottomRight,
+      child: Container(
+        color: Colors.purple,
+        height: 50,
+        width: 50,
+      ),
+    ),
+  ),
+)
+----
+Avec `opaque`, peu importe où vous tapez dans le conteneur, le `GestureDetector` réagira toujours comme s'il avait été touché, même si l'arrière-plan est transparent. Cela garantit que l'événement tactile ne traverse pas ce widget pour atteindre ceux qui pourraient se trouver en dessous.
+
+Ces modes permettent de contrôler finement la réception et la distribution des événements tactiles, surtout dans des interfaces complexes où les éléments graphiques peuvent se chevaucher.
+
+== Disambiguation
+
+Si l'on a deux widgets ajoutés à la liste des events, qui l'emporte. Les deux vont se battre dans une gesture arena. C'est une instance du GestureBinding. Chaque recognizer s'ajoute à l'arena. De ce que je comprends, le premier à répondre qu'il doit être résolu l'emporte et tous les autres sont rejetés. Il ne reste qu'un "winner".
+
+== Handle multiple gestures from multiple recognizers
+
+Pour faire cela on doit aller encore plus profond et pour appeler le listener widget, qui est en dessous du RawGestureDetector.
+
+GestureDetector->RawGestureDetector->Listener
+
+Une bonne définition du listener.
+
+La différence entre le GestureDetector et le listener est que le listener reportera toujours les pointers qu'il voit, tandis que les gestureDetectors vont se battre dans une arena pour l'emporter, et un seul gesture pointer peut l'emporter.
+
+.Listener
+[source, dart]
+----
+return Listener(
+  child: child,
+  onPointerDown: (PointerDownEvent event) => {},
+  onPointerMove: (PointerMoveEvent event) => {},
+  onPointerUp: (PointerUpEvent event) => {},
+  onPointerSignal: (PointerSignalEvent event) => {},
+  onPointerHover: (PointerHoverEvent event) => {},
+  onPointerCancel: (PointerCancelEvent event) => {},
+  behavior: HitTestBehavior.deferToChild|translucent|opaque,
+)
+----
+
+.Exemple
+[source, dart]
+----
+
+return Listener(
+  onPointerDown: (PointerDownEvent event) => {},
+  onPointerMove: (PointerMoveEvent event) => {},
+  onPointerUp: (PointerUpEvent event) => {},
+  child: Scaffold(
+    floatingActionButton: FloatingActionButton(
+      child: const Icon(...),
+      onPressed: () {...}
+    )
+  )
+)
+
+----
+
+== Tester les gestures
+
+.tester les gestures
+[source, dart]
+----
+testWidgets(
+  'shoudl call "on Tap" when receiving a tap gesture',
+  (WidgetTester tester) async {
+    final tapCallback = MockGestureCallback();
+    await tester.pumpWidget(GestureDetector(
+      onTap: tapCallback,
+    ));
+
+    await test.tap(find.byType(GestureDetector))
+
+    verify(() => tapCallback()).called(1);
+
+  }
+)
+----
+
+.emuler des gestes, les différentes méthodes (non exhaustif)
+[source, dart]
+----
+tap(Finder finder);
+longPress(Finder finder);
+drag(Finder finder, Offset offset);
+fling(Finder finder, Offset offset, double speed);
+----
+
+.emuler des gester à partir / jusqu'à une location
+[source, dart]
+----
+tapAt(Offset position);
+longPressAt(Offset position);
+dragFrom(Offset position, Offset offset);
+flingFrom(Offset position, Offset offset, double speed);
+----
+
+Il est également possible d'utiliser une api plus bas niveau pour des mouvements plus complexes et des customGestures
+
+.startGesture et low level gestureApi et up pour lancer le gesture
+[source, dart]
+----
+testWidget(
+  'should call "onVerticalDrag.." callbacks when receiving a drag gesture oriented vertically',
+  (WidgetTester tester) async {
+    final gestureCallback = MockGestureCallback();
+    await tester.pumpWidget(GestureDetector(
+      onVerticalDragStart: gestureCallback,
+      onVerticalDragUpdate: gestureCallback,
+      onVerticalDragEnd: gestureCallback,
+    ));
+
+    const startPosition = Offset(100, 100);
+    final gesture = await tester.startGesture(startPosition);
+    gesture.moveBy(const Offset(0, 100));
+    gesture.up();
+
+    verify(() => gestureCallback(any())).called(3);
+  }
+)
+----

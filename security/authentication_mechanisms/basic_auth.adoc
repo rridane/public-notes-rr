@@ -1,0 +1,319 @@
+// :author: ChatGPT
+:source-highlighter: rouge
+:hardbreaks:
+:toc: left
+:toclevels: 3
+:numbered:
+
+= Authentification HTTP Basic – Fiche complète
+
+== Définition
+
+HTTP Basic Auth est un mécanisme d’authentification défini dans la RFC 7617. Il consiste à transmettre un identifiant et un mot de passe dans chaque requête HTTP via un en-tête `Authorization` encodé en Base64.
+
+== Format de l’en-tête
+
+[source,http]
+----
+Authorization: Basic base64(username:password)
+----
+
+.Exemple
+----
+Authorization: Basic dXNlcjpwYXNzd29yZA==
+# "dXNlcjpwYXNzd29yZA==" = base64("user:password")
+----
+
+== Fonctionnement
+
+. Le client accède à une ressource protégée.
+. Le serveur répond :
+[source,http]
+----
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm="example"
+----
+. Le client renvoie la requête avec l’en-tête `Authorization`.
+
+== Caractéristiques
+
+[cols="1,3",options="header"]
+|===
+|Propriété |Détail
+
+|Stateless
+|Chaque requête est indépendante, pas de session serveur
+
+|Encodage Base64
+|Ne protège pas les données (ce n’est pas un chiffrement)
+
+|Nécessite HTTPS
+|Sinon, les credentials peuvent être interceptés
+
+|Pas de gestion de session
+|Pas de cookie, pas de token, pas d’expiration native
+
+|Interopérable
+|Supporté par tous les serveurs et navigateurs
+|===
+
+== Risques de sécurité
+
+[cols="1,3",options="header"]
+|===
+|Risque |Détail
+
+|Transmission en clair
+|Si non chiffré par HTTPS
+
+|Pas de révocation
+|Impossible d’invalider un identifiant sans changer le mot de passe
+
+|Pas d’expiration
+|Le mot de passe est valide indéfiniment
+
+|Pas de granularité
+|Aucun scope, ni client, ni permissions intégrées
+
+|Pas de logout possible
+|Le navigateur garde les credentials jusqu’à fermeture
+|===
+
+== Limitations pratiques
+
+* Pas de support natif de logout côté navigateur
+* Pas de support de permissions dans le protocole
+* Pas de suivi ou journalisation des sessions
+* Utilisable en CORS seulement si bien configuré (`credentials: include`, headers CORS exposés, voir section associée)
+* Ne supporte pas les permissions ou autorisations avancées
+
+== Basic Auth et CORS – Fonctionnement détaillé
+
+Lorsque Basic Auth est utilisée dans un appel `fetch()` ou `XMLHttpRequest` vers un domaine différent (CORS), le navigateur impose une vérification de sécurité supplémentaire : le préflight.
+
+=== 📌 1. Requête préflight `OPTIONS` (automatique)
+
+Avant d’envoyer la requête réelle, le navigateur envoie une requête `OPTIONS` pour vérifier si le serveur autorise :
+
+- L’origine du client
+- L’en-tête `Authorization`
+- L’usage de credentials
+
+[source,http]
+----
+OPTIONS /api/data HTTP/1.1
+Host: api.example.com
+Origin: https://frontend.example.com
+Access-Control-Request-Method: GET
+Access-Control-Request-Headers: Authorization
+----
+
+=== 📤 2. Réponse du serveur attendue
+
+[source,http]
+----
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://frontend.example.com
+Access-Control-Allow-Methods: GET, POST, OPTIONS
+Access-Control-Allow-Headers: Authorization
+Access-Control-Allow-Credentials: true
+----
+
+[NOTE]
+====
+* `Access-Control-Allow-Origin` doit être l’origine précise, jamais `*` si `Allow-Credentials: true`.
+* `Authorization` est un header non simple : il doit être listé dans `Access-Control-Allow-Headers`.
+* `Access-Control-Allow-Credentials` est requis pour que le navigateur envoie les credentials (cela comprends cookies, en-tête Authorization, client certs)
+====
+
+=== ✅ 3. Requête `GET` réelle envoyée
+
+[source,http]
+----
+GET /api/data HTTP/1.1
+Host: api.example.com
+Origin: https://frontend.example.com
+Authorization: Basic dXNlcjpwYXNz
+----
+
+Cette requête n’est émise **que si** la réponse `OPTIONS` est conforme.
+
+=== 📤 4. Réponse finale du serveur
+
+[source,http]
+----
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: https://frontend.example.com
+Access-Control-Allow-Credentials: true
+Content-Type: application/json
+
+{ "message": "Accès autorisé" }
+----
+
+=== 🚫 Cas d’erreur fréquents
+
+[cols="1,3",options="header"]
+|===
+|Erreur navigateur |Cause
+
+|Access-Control-Allow-Origin: * avec credentials
+|Interdit par la spécification CORS
+
+|Authorization header bloqué
+|Oubli de `Access-Control-Allow-Headers: Authorization`
+
+|Credentials non envoyés
+|Oubli de `credentials: include` côté client ou `Allow-Credentials` côté serveur
+
+|CORS preflight échoue
+|Réponse `OPTIONS` incomplète ou absente
+|===
+
+=== 🧠 En résumé
+
+Pour que Basic Auth fonctionne avec CORS :
+
+- Côté client :
+- `Authorization` dans la requête
+- `credentials: "include"`
+- Côté serveur :
+- `Access-Control-Allow-Origin` spécifique (pas `*`)
+- `Access-Control-Allow-Headers: Authorization`
+- `Access-Control-Allow-Credentials: true`
+
+== Encodage et internationalisation
+
+Par défaut, les identifiants Basic Auth sont encodés en `ISO-8859-1` (latin1), ce qui peut poser des problèmes avec les caractères non-ASCII.
+
+Depuis la RFC 7617, un serveur peut indiquer qu’il attend du `UTF-8` via :
+
+[source,http]
+----
+WWW-Authenticate: Basic realm="example", charset="UTF-8"
+----
+
+⚠️ Tous les clients ne supportent pas cette extension (en particulier les anciens navigateurs ou certains scripts).
+
+== Basic Auth pour les proxies
+
+Basic Auth est aussi utilisé pour authentifier les clients auprès d’un proxy HTTP.
+
+Requête :
+
+[source,http]
+----
+Proxy-Authorization: Basic base64(user:pass)
+----
+
+Réponse :
+
+[source,http]
+----
+407 Proxy Authentication Required
+Proxy-Authenticate: Basic realm="Proxy"
+----
+
+== Utilisation dans les serveurs Web
+
+=== Apache (fichier .htaccess)
+
+[source,apache]
+----
+AuthType Basic
+AuthName "Espace privé"
+AuthUserFile /etc/apache2/.htpasswd
+Require valid-user
+----
+
+=== Nginx
+
+[source,nginx]
+----
+location / {
+  auth_basic "Restricted Area";
+  auth_basic_user_file /etc/nginx/.htpasswd;
+}
+----
+
+=== Création d’un fichier .htpasswd
+
+[source,bash]
+----
+htpasswd -c /etc/nginx/.htpasswd user1
+# Puis entrer le mot de passe
+----
+
+== Bonnes pratiques
+
+* Toujours chiffrer via HTTPS
+* Ne pas l’utiliser pour des APIs publiques sans contrôle supplémentaire
+* Limiter à des cas simples : scripts, tests, environnements internes
+* Ajouter `Cache-Control: no-store` pour éviter le cache de credentials
+* Si possible, utiliser bcrypt comme hash de mot de passe dans `.htpasswd`
+
+== Alternatives recommandées
+
+[cols="1,3",options="header"]
+|===
+|Alternative |Avantages
+
+|JWT (JSON Web Token)
+|Token signé, autoporté, expiration, scopes, roles
+
+|OAuth2
+|Délégation, gestion fine des permissions, clients multiples
+
+|API Key
+|Simplicité, meilleure séparation des clients, mais toujours à sécuriser via HTTPS
+
+|Mutual TLS
+|Très haut niveau de sécurité, mais complexe à déployer
+
+|Session cookie + CSRF
+|Approche classique pour applications Web
+|===
+
+== Exemples de requêtes
+
+=== cURL
+
+[source,bash]
+----
+curl -u user:password https://api.example.com/data
+----
+
+=== JavaScript (Fetch API)
+
+[source,javascript]
+----
+fetch("https://api.example.com/data", {
+  method: "GET",
+  headers: {
+    "Authorization": "Basic " + btoa("user:password")
+  },
+  credentials: "include"
+});
+----
+
+== En résumé
+
+[cols="1,3",options="header"]
+|===
+|Aspect |Résumé
+
+|Simplicité
+|Extrême, universellement supporté
+
+|Sécurité
+|Très faible sans HTTPS, aucun mécanisme de révocation
+
+|Interopérabilité
+|Totale (clients HTTP, navigateurs, serveurs web)
+
+|Cas d’usage pertinents
+|Script, API interne, Docker registry privé, tests rapides
+
+|Cas à éviter
+|Applications Web publiques, API sensibles, absence de HTTPS
+|===
+
