@@ -1,0 +1,1975 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+
+= Hashicorp Vault
+
+Initialiser vault.
+Cette commande initialse 5 clés et le root token.
+
+[source,bash]
+----
+kubectl exec -it -n vault vault-0 -- vault operator init
+----
+
+[source,bash]
+----
+Unseal Key 1: m...
+Unseal Key 2: T...
+Unseal Key 3: U...
+Unseal Key 4: e...
+Unseal Key 5: e...
+----
+
+On fait un unseal de hashicorp en fournissant 3 des 5 clés :
+
+[source,bash]
+----
+kubectl exec -it -n vault vault-0 -- vault operator unseal
+----
+
+On puet alors se connecter avec le root token
+
+[source,bash]
+----
+kubectl exec -it -n vault vault-0 -- vault login <root-token>
+----
+
+[source,bash]
+----
+h_rridane@rc-tvbpce-kcp1:~/vault$ kubectl exec -it -n vault vault-0 -- vault login hv...
+Success! You are now authenticated. The token information displayed below
+is already stored in the token helper. You do NOT need to run "vault login"
+again. Future Vault requests will automatically use this token.
+
+Key                  Value
+---                  -----
+token                hvs.w...
+token_accessor       UlmB...
+token_duration       ∞
+token_renewable      false
+token_policies       ["root"]
+identity_policies    []
+policies             ["root"]
+----
+
+On ne spécifie plus les kubect exec -it -n vault vault-0. On active le module key-value qui permets de stocker des secrets sous forme de key-value
+
+[source,bash]
+----
+/ $ vault secrets enable -path=kv kv-v2
+Success! Enabled the kv-v2 secrets engine at: kv/
+----
+
+== Vault KV (Key-Value) — Commande `vault kv put`
+
+=== Introduction
+
+La commande `vault kv put` permet d’**écrire un secret** dans un moteur KV (Key-Value).
+Un *secret* est stocké sous forme de paires **clé=valeur** dans un *chemin logique* appelé *secret path*.
+Avec KV v2, chaque écriture crée une **nouvelle version** du secret.
+
+Exemple simple :
+
+[source,bash]
+----
+vault kv put kv/app/config API_KEY=super-secret feature_flag=true
+----
+
+* `kv/` → le moteur KV (monté au chemin `kv`)
+* `app/` → dossier logique (hiérarchie que vous définissez)
+* `config` → nom du secret
+* `API_KEY` et `feature_flag` → clés métiers définies librement par l’application
+
+Autrement dit, le secret config dans le dossier logique app stocke deux valeurs, API_KEY et feature_flag.
+
+==== Variantes de base
+
+Écrire plusieurs clés :
+
+[source,bash]
+----
+vault kv put kv/app/config API_KEY=aaa feature_flag=false db_user=demo db_pass=demo123
+----
+
+Écrire depuis un fichier JSON :
+
+[source,json]
+.payload.json
+----
+{
+  "API_KEY": "super-secret",
+  "feature_flag": true
+}
+----
+
+[source,bash]
+----
+vault kv put kv/app/config @payload.json
+----
+
+Lire un secret :
+
+[source,bash]
+----
+vault kv get kv/app/config
+vault kv get -format=json kv/app/config | jq
+----
+
+Lister les secrets :
+
+[source,bash]
+----
+vault kv list kv/
+vault kv list kv/app/
+----
+
+Supprimer un secret (soft delete) :
+
+[source,bash]
+----
+vault kv delete kv/app/config
+----
+
+Détruire définitivement une version donnée :
+
+[source,bash]
+----
+vault kv destroy -versions=2 kv/app/config
+----
+
+Relire une version antérieure :
+
+[source,bash]
+----
+vault kv get -version=1 kv/app/config
+----
+
+=== 6️⃣ Options utiles de `vault kv put`
+
+==== `-mount=otherkv`
+
+Permet de spécifier un autre moteur KV que celui par défaut.
+
+Exemple : vous avez activé un second moteur KV nommé `secrets` :
+
+[source,bash]
+----
+vault secrets enable -path=secrets kv-v2
+vault kv put -mount=secrets app/config API_KEY=secret2
+vault kv get secrets/app/config
+----
+
+Ici, le secret est stocké dans le moteur `secrets/` et non `kv/`.
+
+==== `-cas=<version>`
+
+*CAS* = *Check-And-Set*.
+Cette option assure que l’écriture n’écrase pas une version différente de celle attendue.
+Elle est utile en cas d’écritures concurrentes (concurrency control).
+
+Exemple :
+
+[source,bash]
+----
+# Le secret est actuellement en version 3
+vault kv put -cas=3 kv/app/config API_KEY=newvalue
+# => succès
+
+vault kv put -cas=2 kv/app/config API_KEY=oldvalue
+# => erreur, car la version attendue (2) n’est pas la version actuelle (3)
+----
+
+==== `-force`
+
+Permet une écriture forcée, même sans données.
+Pratique pour réinitialiser un secret ou créer une version vide.
+
+Exemple :
+
+[source,bash]
+----
+# Force l'écriture d'une nouvelle version sans contenu
+vault kv put -force kv/app/config
+----
+
+Résultat : une nouvelle version du secret est créée, mais sans clés/valeurs.
+
+=== Organisation des dossiers
+
+Une structure simple mais scalable est la suivante:
+
+[source,bash]
+----
+kv/data/<env>/<app>/<category>/<secret>
+----
+
+[source,bash]
+----
+kv/data/prod/rr-dev-service/db/credentials
+kv/data/prod/rr-dev-service/api/payment-provider
+kv/data/staging/rr-dev-service/config/feature_flags
+----
+
+=== Résumé
+
+* `vault kv put` → écriture d’un secret clé/valeur dans Vault
+* Le chemin est un *secret path* hiérarchique (ex : `kv/app/config`)
+* KV v2 conserve l’historique des versions
+* Options avancées :
+** `-mount` → choisir le moteur KV
+** `-cas` → écriture conditionnelle (check-and-set)
+** `-force` → écriture vide forcée
+
+== Vault — Consommation des secrets (État de l’art)
+
+=== Introduction
+
+Après avoir organisé et stocké vos secrets dans Vault, la question est :
+*Comment les applications, les pipelines CI/CD, et les workloads consomment ces secrets ?*
+
+L’état de l’art repose sur trois principes :
+1. **Pas de tokens statiques** → utiliser une *auth method* automatique.
+2. **Pas de secrets en clair** → injection via sidecar, CSI ou variables d’environnement éphémères.
+3. **Rotation automatique** → privilégier les secrets dynamiques (DB, cloud, PKI).
+
+=== Consommation par CLI / API
+
+Méthode la plus simple mais rarement utilisée en production.
+Pratique pour les tests ou le débogage.
+
+[source,bash]
+----
+# Lire un secret depuis le CLI
+vault kv get kv/prod/app/db
+
+# Lire uniquement une clé spécifique
+vault kv get -field=password kv/prod/app/db
+
+# Via API HTTP
+curl -s \
+  -H "X-Vault-Token: $VAULT_TOKEN" \
+  $VAULT_ADDR/v1/kv/data/prod/app/db | jq
+----
+
+== Kubernetes Auth + Vault Agent Injector (sidecar)
+
+Méthode recommandée dans Kubernetes.
+Un *mutating webhook* ajoute un sidecar `vault-agent` qui s’authentifie (via le ServiceAccount du Pod), lit les secrets depuis Vault et les écrit dans des **fichiers** dans le conteneur applicatif.
+
+=== Rappels importants (comportement par défaut)
+
+* Montage par défaut des secrets rendus : */vault/secrets* (répertoire dans le Pod/app).
+* Pour chaque secret injecté, on utilise une annotation de la forme :
+- `vault.hashicorp.com/agent-inject-secret-<NAME>: "<VAULT_PATH>"`
+* **Nom de fichier par défaut** : si tu n’indiques rien d’autre, le contenu du secret sera écrit dans un fichier nommé **`<NAME>`** sous */vault/secrets/*.
+- Exemple : `agent-inject-secret-db-creds: "kv/data/prod/app/db"` ⇒ fichier créé par défaut : */vault/secrets/db-creds*
+* **Contenu par défaut** :
+- Sans template, l’Agent écrit la **réponse brute** du secret (pour KV v2, typiquement en **JSON** contenant `.data.data`).
+- En pratique, on préfère **définir un template** pour générer exactement le format voulu (JSON épuré, `.env`, clé unique, etc.).
+
+=== Comment maîtriser le NOM du fichier
+
+Utilise l’annotation **`vault.hashicorp.com/agent-inject-file-<NAME>`** pour fixer le nom (et éventuellement un sous-répertoire) du fichier rendu :
+
+[source,yaml]
+----
+metadata:
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "app-reader"
+
+    # Déclare le secret à récupérer
+    vault.hashicorp.com/agent-inject-secret-db-creds: "kv/data/prod/app/db"
+
+    # (Optionnel) Force le nom du fichier au lieu du défaut "/vault/secrets/db-creds"
+    vault.hashicorp.com/agent-inject-file-db-creds: "config/db/credentials.json"
+----
+Résultat : le secret est écrit dans *`/vault/secrets/config/db/credentials.json`*.
+
+> Tu peux mettre un chemin relatif sous `/vault/secrets` (des sous-dossiers seront créés).
+
+=== Comment changer le DOSSIER cible
+
+Le dossier racine par défaut est */vault/secrets*.
+Pour le modifier globalement pour ce Pod, ajoute :
+
+[source,yaml]
+----
+metadata:
+  annotations:
+    vault.hashicorp.com/secret-volume-path: "/work/secrets"
+----
+Tous les fichiers injectés seront alors sous */work/secrets/*.
+
+=== Comment maîtriser le CONTENU (template)
+
+Utilise **`vault.hashicorp.com/agent-inject-template-<NAME>`** pour rendre exactement ce que tu veux.
+
+*Exemple 1 — JSON minimal avec toutes les clés du secret KV v2 :*
+[source,yaml]
+----
+metadata:
+  annotations:
+    vault.hashicorp.com/agent-inject-secret-app-config: "kv/data/prod/app/config"
+    vault.hashicorp.com/agent-inject-file-app-config: "config/app.json"
+    vault.hashicorp.com/agent-inject-template-app-config: |
+      {{- with secret "kv/data/prod/app/config" -}}
+      {{ toJSON .Data.data }}
+      {{- end -}}
+----
+Résultat : */vault/secrets/config/app.json* contient uniquement les **données** (`.Data.data`) du KV (sans le wrapping).
+
+*Exemple 2 — ne rendre qu’une **clé spécifique** (ex: `password`) :*
+[source,yaml]
+----
+metadata:
+  annotations:
+    vault.hashicorp.com/agent-inject-secret-db-pass: "kv/data/prod/app/db"
+    vault.hashicorp.com/agent-inject-file-db-pass: "db/password.txt"
+    vault.hashicorp.com/agent-inject-template-db-pass: |
+      {{- with secret "kv/data/prod/app/db" -}}
+      {{ .Data.data.password }}
+      {{- end -}}
+----
+Résultat : */vault/secrets/db/password.txt* ne contient **que** la valeur du mot de passe.
+
+*Exemple 3 — format `.env` :*
+[source,yaml]
+----
+metadata:
+  annotations:
+    vault.hashicorp.com/agent-inject-secret-env: "kv/data/prod/app/config"
+    vault.hashicorp.com/agent-inject-file-env: ".env"
+    vault.hashicorp.com/agent-inject-template-env: |
+      {{- with secret "kv/data/prod/app/config" -}}
+      {{- range $k, $v := .Data.data -}}
+      {{ $k }}={{ $v }}
+      {{ end -}}
+      {{- end -}}
+----
+
+=== Pattern exact des annotations
+
+* **Activer l’injection** :
+`vault.hashicorp.com/agent-inject: "true"`
+* **Rôle Vault (policy)** :
+`vault.hashicorp.com/role: "<vault-role-name>"`
+* **Déclarer un secret** :
+`vault.hashicorp.com/agent-inject-secret-<NAME>: "<VAULT_PATH>"`
+- `<NAME>` : suffixe libre, **sert de nom de fichier par défaut** si `agent-inject-file-<NAME>` n’est pas fourni.
+- `<VAULT_PATH>` : chemin API du secret (ex: `kv/data/prod/app/db` pour KV v2).
+* **Nom du fichier rendu (optionnel)** :
+`vault.hashicorp.com/agent-inject-file-<NAME>: "<relative/path.ext>"`
+- Chemin **relatif** au volume des secrets (par défaut `/vault/secrets` ou ce que tu as mis dans `secret-volume-path`).
+* **Template du contenu (optionnel)** :
+`vault.hashicorp.com/agent-inject-template-<NAME>: |` *(puis le template)*
+
+> Si tu ne fournis **ni** `agent-inject-file-<NAME>` **ni** `agent-inject-template-<NAME>`, alors :
+> * le fichier s’appellera `/<volume>/<NAME>`
+> * son **contenu** sera la **réponse brute** du secret (souvent JSON pour KV v2).
+
+=== Exemple complet (multi-secrets, noms & contenus maîtrisés)
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Pod
+metadata:
+  name: injector-demo
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "app-reader"
+    vault.hashicorp.com/secret-volume-path: "/work/secrets"
+
+    # 1) Secret DB (fichier JSON minimal)
+    vault.hashicorp.com/agent-inject-secret-db-creds: "kv/data/prod/app/db"
+    vault.hashicorp.com/agent-inject-file-db-creds: "db/credentials.json"
+    vault.hashicorp.com/agent-inject-template-db-creds: |
+      {{- with secret "kv/data/prod/app/db" -}}
+      {{ toJSON .Data.data }}
+      {{- end -}}
+
+    # 2) Secret CONFIG (.env)
+    vault.hashicorp.com/agent-inject-secret-config-env: "kv/data/prod/app/config"
+    vault.hashicorp.com/agent-inject-file-config-env: "config/.env"
+    vault.hashicorp.com/agent-inject-template-config-env: |
+      {{- with secret "kv/data/prod/app/config" -}}
+      {{- range $k, $v := .Data.data -}}
+      {{ $k }}={{ $v }}
+      {{ end -}}
+      {{- end -}}
+spec:
+  serviceAccountName: sa-app-reader
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh","-lc","find /work/secrets -type f -maxdepth 3 -print -exec echo '----' \\; -exec cat {} \\; ; sleep 3600"]
+----
+
+=== Que se passe-t-il quand un secret CHANGE ?
+
+* Le sidecar `vault-agent` **surveille** et **renouvelle** les secrets (TTL/leases).
+* Si la valeur change, le **fichier est réécrit** (même chemin), ce qui permet à l’app de recharger sans redéployer.
+* Pour signaler à l’app de recharger, tu peux déclencher une commande :
+- Globalement : `vault.hashicorp.com/agent-inject-command: "<cmd>"`
+- Ou par fichier : `vault.hashicorp.com/agent-inject-command-<NAME>: "<cmd>"`
+
+*Exemple (recharger Nginx) :*
+[source,yaml]
+----
+metadata:
+  annotations:
+    vault.hashicorp.com/agent-inject-command-db-creds: '["/bin/sh","-c","kill -HUP 1"]'
+----
+
+=== Sécurité & connexions
+
+* Le sidecar s’authentifie via le **ServiceAccount** du Pod (Kubernetes Auth).
+* Tu peux préciser une config TLS client (annotation `vault.hashicorp.com/tls-secret`) pour sécuriser la connexion à Vault.
+* Tout accès est **journalisé** si l’audit est activé côté Vault.
+
+=== Résumé précis
+
+* **`/agent-inject-secret-<NAME>`** ⇒ déclare un secret Vault ; crée un **fichier par défaut** nommé `<NAME>`.
+* **`/agent-inject-file-<NAME>`** ⇒ **change le nom (et sous-chemin)** du fichier rendu.
+* **`/agent-inject-template-<NAME>`** ⇒ **contrôle le contenu** (JSON, clé unique, `.env`, etc.).
+* **`/secret-volume-path`** ⇒ change le **répertoire racine** (par défaut `/vault/secrets`).
+* Sans template, le contenu est la **réponse brute** (souvent JSON KV v2).
+* Sans `-file`, le nom = **`<NAME>`** (suffixe de l’annotation `agent-inject-secret-<NAME>`).
+* Le sidecar **met à jour** les fichiers si les secrets changent (et peut lancer une commande de reload).
+
+== Kubernetes CSI Driver
+
+Alternative moderne : le *CSI Secrets Store Driver*.
+Il monte les secrets directement comme un volume, sans sidecar.
+
+Exemple :
+
+[source,yaml]
+----
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: spc-db
+spec:
+  provider: vault
+  parameters:
+    vaultAddress: "http://vault.vault.svc.cluster.local:8200"
+    roleName: "app-reader"
+    objects: |
+      - objectName: "kv/data/prod/app/db"
+        secretPath: "kv/data/prod/app/db"
+        secretKey: "password"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: csi-demo
+spec:
+  serviceAccountName: sa-app-reader
+  volumes:
+  - name: secrets-store-inline
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: "spc-db"
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh","-c","ls /mnt/secrets-store && cat /mnt/secrets-store/*; sleep 3600"]
+    volumeMounts:
+    - name: secrets-store-inline
+      mountPath: "/mnt/secrets-store"
+      readOnly: true
+----
+
+Résultat attendu :
+le mot de passe DB est monté dans `/mnt/secrets-store/password`.
+
+== CI/CD (GitLab, GitHub Actions, Jenkins)
+
+État de l’art : utiliser **OIDC** ou **AppRole** pour que le pipeline s’authentifie automatiquement.
+Les secrets sont injectés dans des variables d’environnement, valides uniquement pendant le job.
+
+Exemple GitLab CI (OIDC → Vault) :
+
+[source,yaml]
+----
+stages:
+  - deploy
+
+deploy:
+  image: hashicorp/vault:1.17
+  script:
+    # login via OIDC (GitLab → Vault)
+    - export VAULT_TOKEN=$(vault write -field=token auth/jwt/login role=gitlab-ci jwt=$CI_JOB_JWT)
+    # récupérer un mot de passe DB
+    - DB_PASS=$(vault kv get -field=password kv/prod/app/db)
+    - echo "Mot de passe récupéré: $DB_PASS"
+----
+
+== AppRole (VM, batch, legacy)
+
+Méthode utilisée pour des environnements hors Kubernetes ou sans OIDC.
+L’application possède un `role_id` et un `secret_id`, et les échange contre un token Vault.
+
+[source,bash]
+----
+# L'app récupère son role_id et secret_id (provisionnés avant)
+ROLE_ID="1111-aaaa-xxxx"
+SECRET_ID="2222-bbbb-yyyy"
+
+# Login à Vault
+TOKEN=$(vault write -field=token auth/approle/login \
+  role_id=$ROLE_ID \
+  secret_id=$SECRET_ID)
+
+# Utiliser le token pour lire le secret
+VAULT_TOKEN=$TOKEN vault kv get kv/prod/app/db
+----
+
+== Applications via SDK / API
+
+Les applications modernes peuvent intégrer directement les SDK Vault (Go, Java, Python).
+Elles obtiennent un token via l’auth method adaptée, puis appellent l’API Vault.
+
+Exemple Python :
+
+[source,python]
+----
+import hvac
+
+client = hvac.Client(url="http://127.0.0.1:8200", token="...")
+
+# Lire un secret
+secret = client.secrets.kv.read_secret_version(path="prod/app/db")
+print(secret["data"]["data"]["password"])
+----
+
+== Vault — Paths, Plugins & Extensions (vue d’ensemble + plugins + custom)
+
+=== Vue d’ensemble
+* Les **paths** sont le cœur de Vault : chaque path correspond à une **API** exposée par un *engine* (ex: `kv/data/...`, `database/creds/...`, `transit/encrypt/...`).
+* Il existe des *engines* **noyau** (ex: KV v2, Transit, PKI) et des *engines* fournis via des **plugins**.
+* L’accès à ces API est **protégé par des policies** (ACL).
+Un **auth role** (Kubernetes/OIDC/AppRole/…) **agrège** des policies et les **attache** à un **token** lors de l’authentification (RBAC). Nous verrons dans le chapitre suivant le fonctionnement précis des policies.
+* Certains engines (Database, PKI, AWS, …) exposent aussi la notion de **secrets engine roles** (recettes de génération), sans rapport avec les *auth roles*.
+
+[NOTE]
+====
+Terminologie “role” :
+- **Auth role** → agrégation de policies donnée à une identité (Pod, groupe OIDC…), côté méthode d’auth.
+- **Secrets engine role** → recette interne d’un engine (ex: SQL + TTL pour Database).
+====
+
+=== 2) Principaux *Secrets Engines* (built-in)
+
+Les *secrets engines* stockent, génèrent ou chiffrent des données. Liste synthétique (les docs officielles listent l’ensemble et les variantes) :
+
+* **KV (v1/v2)** — stockage clé/valeur (v2 = versions/metadata).
+* **Cubbyhole** — stockage privé par token.
+* **Transit** — chiffrement/déchiffrement “as a service” (stateless).
+* **PKI** — CA interne, émission/rotation de certificats.
+* **Database** — identifiants DB dynamiques (Postgres, MySQL/MariaDB, MSSQL, Cassandra, MongoDB, etc. via plugins DB). :contentReference[oaicite:1]{index=1}
+* **Cloud** — AWS (IAM STS), Azure, GCP (SA keys/STS), etc.
+* **SSH** — OTP/signed keys.
+* **TOTP** — codes one-time.
+* **RabbitMQ, Consul, Active Directory** — accès/rotations spécifiques (selon versions/éditions).
+* **Identity/Token** — gestion interne d’identité et de tokens.
+
+[NOTE]
+====
+Pour voir ce qui est **activé** sur votre serveur :
+`vault secrets list` (liste des engines montés et leurs paths). :contentReference[oaicite:2]{index=2}
+====
+
+=== 3) Principales **Auth Methods** (built-in)
+Les auth methods réalisent l’**authentification** et attribuent des **policies**. La page officielle maintient la liste à jour :
+
+* **Kubernetes** (JWT de ServiceAccount) — standard pour pods K8s.
+* **OIDC/JWT** (Keycloak, GitHub, GitLab, Okta, …).
+* **AppRole** (VM/batch/legacy).
+* **Cloud IAM** : AWS, Azure, GCP.
+* **LDAP**, **GitHub**, **Username/Password**, **Token** (intégré), etc.
+
+[NOTE]
+====
+Pour voir les **auth methods** activées :
+`vault auth list` (affiche aussi le statut de dépréciation depuis Vault 1.12+).
+====
+
+=== 4) “Exhaustif” vs “exemples”
+Le catalogue exact évolue (versions & Enterprise). Référez-vous aux pages “Secrets engines” et “Auth methods” de la doc HashiCorp pour la liste *à jour* des moteurs/plugins pris en charge. :contentReference[oaicite:5]{index=5}
+
+=== 5) Architecture Plugins (comment ça marche)
+Vault charge les plugins comme **binaires séparés**, communiquant via RPC ; un crash de plugin ne fait pas tomber Vault (isolation). La **Plugin Catalog** enregistre les plugins avec une **empreinte SHA256** avant de pouvoir les activer.
+
+Types de plugins pris en charge :
+* **secret** (nouvel engine de secrets),
+* **auth** (nouvelle méthode d’auth),
+* **database** (nouveau provider DB au sein de l’engine Database).
+
+=== 6) Créer un **custom plugin** (secrets engine ou auth)
+
+Résumé des étapes officielles (voir tutoriels HashiCorp pour le pas-à-pas et le code Go) :
+
+. **Coder** en Go avec le **Vault SDK** (backend `framework.Backend`), définir les **paths** (CRUD, config) et la logique (ex: appeler une API tierce pour générer un token).
+. **Compiler** le binaire (GOOS/GOARCH de la cible Vault).
+. **Déployer** le binaire dans le **plugin_directory** du serveur Vault (config serveur).
+. **Calculer la SHA256** du binaire.
+. **Enregistrer** dans la **Plugin Catalog** :
+`vault plugin register -sha256=<SHA> secret <plugin-name>`
+(ou `auth` / `database` selon le type). :contentReference[oaicite:9]{index=9}
+. **Activer** le plugin :
+* Secrets engine :
+`vault secrets enable -path=<mount> -plugin-name=<plugin-name> plugin`
+* Auth method :
+`vault auth enable -plugin-name=<plugin-name> plugin`
+* Database provider : enregistrer le plugin puis l’utiliser dans `database/config/...` via `plugin_name=<your-db-plugin>`. :contentReference[oaicite:10]{index=10}
+. **Configurer** votre engine (paths de config/roles…) et tester.
+
+[NOTE]
+====
+En dev, on peut utiliser un **répertoire de plugins de test** et/ou l’option `-dev-plugin-dir` avec le serveur.
+Les guides “Custom secrets engines” et “Plugin backends” contiennent un pas-à-pas complet et du code d’exemple. :contentReference[oaicite:11]{index=11}
+====
+
+=== Wrappers CLI vs API brute
+
+Vault expose uniquement des **endpoints API** (`/v1/kv/data/...`, `/v1/database/creds/...`, etc.).
+Toutes les opérations se font en réalité via les commandes génériques :
+
+* `vault write <path>` → créer ou modifier (POST/PUT API)
+* `vault read <path>` → lire (GET API)
+* `vault delete <path>` → supprimer (DELETE API)
+* `vault list <path>` → lister (LIST API)
+
+Pour plus de confort, le binaire CLI de Vault inclut des **wrappers spécialisés**.
+Exemple avec KV v2 :
+
+* `vault kv put kv/app/config password=123`
+est un alias pratique pour :
+`vault write kv/data/app/config data='{"password":"123"}'`
+
+* `vault kv get kv/app/config`
+est un alias pour :
+`vault read kv/data/app/config`
+
+Ces wrappers n’existent que pour certains engines (KV, auth enable/disable, etc.).
+On **ne peut pas créer ses propres sous-commandes `vault ...`** côté Vault :
+- Soit on utilise les commandes génériques (`read/write/list/delete`).
+- Soit on crée des **alias shell** (bash/zsh) pour son usage.
+- Pour Vault lui-même, la seule façon d’avoir un nouveau wrapper est de **modifier le CLI en Go** (ou d’attendre une commande officielle ajoutée par HashiCorp).
+
+[NOTE]
+====
+👉 Donc : *les paths sont la vérité fondamentale*, les wrappers CLI ne sont que du *sucre syntaxique* pour simplifier l’usage courant (notamment avec KV v2).
+====
+
+=== Bonnes pratiques plugins
+* **Versionner** vos plugins (implémenter l’interface de versioning du SDK) pour simplifier mises à jour/compatibilité. :contentReference[oaicite:12]{index=12}
+* **Signer/vérifier** (SHA256) et restreindre l’accès au `plugin_directory`.
+* **Limiter** les capabilities via des **policies** dédiées aux paths du plugin.
+* **Tests** d’intégration (start Vault, register, enable, hit endpoints).
+* **Observabilité** : logs côté plugin + **audit** côté Vault.
+
+=== 8) Exemples & ressources officielles pour démarrer
+* **Tutoriel “Custom secrets engine”** (série complète avec code/paths, build & run). :contentReference[oaicite:13]{index=13}
+* **Architecture & Dev plugins** (SDK, interfaces, versioning). :contentReference[oaicite:14]{index=14}
+* **Register external plugins** (catalog, répertoires, formats). :contentReference[oaicite:15]{index=15}
+* **Exemples GitHub** : *hello-world* / *hashicups* secrets engine. :contentReference[oaicite:16]{index=16}
+
+== Vault — Policies (ACL), Capabilities & Patterns
+
+=== Pourquoi des policies ?
+
+Une *policy* définit **qui peut faire quoi, où** dans l’API Vault.
+Elle associe un **chemin d’API** (ex: `kv/data/prod/app/*`, `database/roles/app-db-read`) à des **capabilities** (droits).
+
+*Les policies ne “créent” pas d’identités.*
+
+Elles sont **attachées à un token** (obtenu via une *auth method* : Kubernetes, OIDC, AppRole…), et Vault évalue alors les droits du token sur chaque requête.
+
+=== Vue d’ensemble : Policies et Roles
+
+* **Policy** = brique élémentaire.
+Elle définit un jeu de droits (capabilities) sur un ou plusieurs chemins de l’API Vault.
+
+* **Role (côté Auth)** = une **agrégation de policies** attachée à une identité externe.
+Exemple : un ServiceAccount Kubernetes, un groupe OIDC, un AppRole.
+Quand cette identité s’authentifie, Vault lui attribue les policies listées dans ce rôle.
+→ C’est l’équivalent d’un rôle RBAC classique.
+
+* **Token Vault** = contient un ensemble de policies.
+Ces policies proviennent soit directement de la création du token (`vault token create -policy=...`), soit d’un *auth role* (Kubernetes, OIDC, AppRole…).
+
+[NOTE]
+====
+⚠️ Ambiguïté : le mot *role* est utilisé aussi côté *secrets engines* (Database, PKI, AWS, etc.).
+- **Auth Role** → fait le lien entre une identité (Pod, user OIDC, VM…) et des policies.
+- **Secrets Engine Role** → décrit une *recette de génération de secrets dynamiques* (SQL pour Database, profil de certificat pour PKI, etc.).
+
+Il faut bien distinguer les deux contextes, même si HashiCorp a réutilisé le même terme.
+====
+
+=== Les capabilities (droits)
+[cols="20,80"]
+|===
+| Capability | Effet typique
+
+| `read`     | Lire une ressource (ex: `vault kv get`, `GET` API).
+| `list`     | Lister les éléments d’un préfixe (ex: `vault kv list`, `LIST` API).
+| `create`   | Créer une ressource (ex: première écriture sur un chemin).
+| `update`   | Modifier/écrire (`vault write`, `POST/PUT` API). *Le CLI `write` mappe vers `create`/`update` selon le cas.*
+| `delete`   | Supprimer (ex: `vault kv delete`, `DELETE` API).
+| `sudo`     | Actions sensibles (montages `sys/*`, activer/disable engines/auth, etc.). À éviter pour des tokens applicatifs.
+|===
+
+[NOTE]
+====
+*Par défaut tout est refusé.*
+Les permissions s’additionnent entre policies attachées au token.
+La règle la plus **spécifique** l’emporte. Si un “deny” explicite existe (rare en OSS), il prévaut.
+====
+
+=== Chemins (paths) : bien viser la bonne API
+Chaque *secrets engine* expose ses **propres endpoints**.
+Exemples usuels :
+
+* **KV v2** : `kv/data/...` (données), `kv/metadata/...` (liste/versions), `kv/destroy/...`, `kv/undelete/...`
+* **Database** : `database/config/...`, `database/roles/...` (config), `database/creds/...` (consommation)
+* **Transit** : `transit/encrypt/<key>`, `transit/decrypt/<key>`
+* **PKI** : `pki/roles/<role>`, `pki/issue/<role>`
+
+[IMPORTANT]
+====
+*KV v2* :
+- **Lire/écrire** un secret → ciblez **`kv/data/<path>`** (capabilities `read`, `update`).
+- **Lister** les clés → ciblez **`kv/metadata/<prefix>`** (capability `list`).
+- **Supprimer (soft delete)** une *version* → `kv/delete/<path>` (capability `update`).
+- **Détruire (destroy)** une *version* → `kv/destroy/<path>` (capability `update`).
+- **Supprimer tout le secret (metadata)** → `kv/metadata/<path>` (capability `delete`).
+====
+
+=== Exemples concrets (KV v2)
+
+Lecture simple d’un secret (et *list* sur le dossier) :
+
+[source,hcl]
+----
+# Lire les données (toutes versions via v2)
+path "kv/data/prod/app/db" {
+  capabilities = ["read"]
+}
+
+# Lister les clés sous prod/app/
+path "kv/metadata/prod/app/" {
+  capabilities = ["list"]
+}
+----
+
+Écriture (create/update) et suppression :
+[source,hcl]
+----
+# Écrire (create/update) le secret
+path "kv/data/prod/app/db" {
+  capabilities = ["create", "update"]
+}
+
+# Supprimer totalement (metadata + toutes versions)
+path "kv/metadata/prod/app/db" {
+  capabilities = ["delete"]
+}
+----
+
+Gestion fine des versions :
+[source,hcl]
+----
+# Soft-delete de versions (les données deviennent "deleted")
+path "kv/delete/prod/app/db" {
+  capabilities = ["update"]
+}
+
+# Détruire définitivement des versions (irréversible)
+path "kv/destroy/prod/app/db" {
+  capabilities = ["update"]
+}
+
+# Restaurer des versions soft-deleted
+path "kv/undelete/prod/app/db" {
+  capabilities = ["update"]
+}
+----
+
+=== Exemples concrets (Database engine)
+
+Consommer des identifiants **éphémères** (lecture sur `/creds/…`) :
+
+[source,hcl]
+----
+# Autoriser l'app à générer des creds temporaires:
+path "database/creds/app-db-read" {
+  capabilities = ["read"]
+}
+----
+
+*Ne pas confondre* avec la **configuration** du rôle :
+[source,hcl]
+----
+# VOIR la config du rôle (optionnel)
+path "database/roles/app-db-read" {
+  capabilities = ["read", "list"]
+}
+
+# MODIFIER la config du rôle (SQL/TTL) - à réserver aux ops :
+path "database/roles/app-db-read" {
+  capabilities = ["update"]  # voire create/delete si besoin
+}
+----
+
+=== Wildcards & spécificité
+
+Vault supporte les jokers :
+- `*` : un segment (ou plus) selon le chemin
+- `+` : (sur certains endpoints) un segment simple
+- `...` : (peut apparaître dans docs historiques, préférez des préfixes clairs)
+
+Privilégiez des *préfixes explicites* pour éviter les surprises :
+[source,hcl]
+----
+# Bon: scope précis par environnement et app
+path "kv/data/prod/rr-dev-service/*" { capabilities = ["read"] }
+
+# À éviter: trop large
+path "kv/data/*" { capabilities = ["read"] }
+----
+
+[NOTE]
+====
+La *règle la plus spécifique* l’emporte si plusieurs chemins matchent.
+Organisez vos secrets par `env/app/category/secret` pour écrire des policies simples et sûres.
+====
+
+=== Lister (list) : souvent oublié
+Pour **`vault kv list`** (ou liste des secrets côté UI/CLI), il faut une policy dédiée :
+[source,hcl]
+----
+# Lister le dossier => utilisez "metadata"
+path "kv/metadata/prod/rr-dev-service/" {
+  capabilities = ["list"]
+}
+----
+
+=== Policy files : HCL vs JSON
+
+Deux formats équivalents :
+- **HCL** (humain) → `vault policy write app-read app-read.hcl`
+- **JSON** (machines) → `vault policy write app-read @app-read.json`
+
+Format HCL minimal :
+[source,hcl]
+----
+# app-read.hcl
+path "kv/data/prod/rr-dev-service/*" {
+  capabilities = ["read"]
+}
+
+path "kv/metadata/prod/rr-dev-service/" {
+  capabilities = ["list"]
+}
+
+----
+
+=== Attacher des policies à un token (via Auth)
+
+Les policies s’attachent à l’**identité** au moment du login :
+
+* **Kubernetes Auth** : un *role* associe SA/namespace → policies
+[source,bash]
+----
+vault write auth/kubernetes/role/rr-dev-app \
+  bound_service_account_names=sa-rr-dev \
+  bound_service_account_namespaces=apps \
+  policies="rr-dev-read,db-creds" \
+  ttl="1h"
+----
+
+* **OIDC/JWT (GitLab/GitHub/Keycloak)** : mapping de claims → policies
+* **AppRole** : rôle nommé → policies (pour VM/batch)
+
+[NOTE]
+====
+Tous les tokens reçoivent la policy `default`.
+Évitez d’utiliser `root` (accès illimité) ailleurs qu’au bootstrap.
+====
+
+=== Restreindre ce qui peut être écrit (allowed/denied parameters)
+
+Vous pouvez limiter **les champs et valeurs** qu’un appelant est autorisé à écrire sur un endpoint (utile pour `auth/token/create`, certains engines, etc.).
+
+Exemple (limiter la création de tokens côté CI) :
+[source,hcl]
+----
+# Autoriser seulement certaines politiques et TTLs à la création de tokens
+path "auth/token/create" {
+  capabilities = ["update"]
+  allowed_parameters = {
+    "policies" = ["^app-.*$"]     # doivent commencer par "app-"
+    "ttl"      = ["15m", "30m"]   # valeurs autorisées
+  }
+  denied_parameters = {
+    "no_default_policy" = ["true"]  # interdit de retirer la policy 'default'
+  }
+}
+----
+
+=== Wrapping (contrainte de TTL du wrapping)
+
+Vous pouvez contraindre les *response-wrapping tokens* (jetons one-shot) :
+[source,hcl]
+----
+path "kv/data/prod/rr-dev-service/*" {
+  capabilities = ["read"]
+  min_wrapping_ttl = "10s"
+  max_wrapping_ttl = "5m"
+}
+----
+
+=== Bonnes pratiques (état de l’art)
+* **Structure claire** des paths secrets : `kv/<env>/<app>/<category>/<secret>`
+* **Policies par app** et par **environnement** (évitez les globaux)
+* **Toujours séparer** *consommation* et *configuration* (ex: `database/creds/*` ≠ `database/roles/*`)
+* **N’accordez pas `sudo`** aux workloads applicatifs
+* **Pensez à `list`** (KV v2 → sur `metadata/`) pour la découvrabilité
+* **GitOps** : versionnez policies & roles (Terraform / Helm / repo “iam-vault”)
+* **Principe du moindre privilège** : réduisez le scope au strict nécessaire
+* **Audit activé** côté Vault (traces des accès)
+
+=== Anti-patterns courants
+* Donner `update` sur `database/roles/*` à une app → elle pourrait **modifier le SQL** de génération des comptes.
+* Oublier `list` sur `kv/metadata/...` → impossible de lister les clés côté CLI/UI.
+* Utiliser des politiques trop larges (`kv/data/*`) → risque d’exfiltration.
+* Confondre **KV v1 vs v2** (chemins différents). En v2, c’est `data/` pour lire/écrire,
+
+== Vault — Secrets dynamiques Database (PostgreSQL)
+
+=== KV vs “Database engine” (la différence fondamentale)
+
+*KV v2* = stockage **statique** de paires clé/valeur (vous écrivez et relisez).
+*Database engine* = secrets **dynamiques** générés **à la demande** par un **plugin** (ici PostgreSQL).
+Quand vous lisez `database/creds/<role>`, Vault :
+1. se connecte à votre base avec un **compte administrateur** configuré,
+2. exécute des **instructions SQL** (définies dans le *role Vault*) pour **créer un user temporaire**,
+3. renvoie `username/password` **avec TTL** + un **lease_id** (renouvelable/révocable).
+
+=> L’éphémérité vient de la **définition du rôle** (TTL, SQL), pas de la commande `read` en soi.
+
+=== Pré-requis (exemple)
+
+* Un PostgreSQL accessible (ici un Service K8s `pg.apps.svc:5432`, base `demo`)
+* Un **compte admin** Postgres qui peut `CREATE ROLE`, `GRANT`, etc. (ici `demo/supersecret`)
+* Vault déployé et joignable (ex: `http://vault.vault.svc:8200`)
+
+=== Activer et configurer le moteur Database
+
+[source,bash]
+----
+# (si nécessaire) Activer le secrets engine "database" au point de montage /database
+vault secrets enable database
+
+# Déclarer une connexion "demo-postgres"
+vault write database/config/demo-postgres \
+  plugin_name=postgresql-database-plugin \
+  allowed_roles="app-db-read,app-db-readwrite" \
+  connection_url="postgresql://{{username}}:{{password}}@pg.apps.svc.cluster.local:5432/demo?sslmode=disable" \
+  username="demo" \
+  password="supersecret"
+----
+
+Explications :
+* `plugin_name` : le plugin utilisé (ici PostgreSQL).
+* `connection_url` : gabarit que Vault utilise **avec** `username`/`password` ci-dessus pour se connecter en admin.
+* `allowed_roles` : la liste des *rôles Vault* autorisés à utiliser cette connexion.
+
+=== Comprendre la structure des chemins Database
+
+Une fois le moteur Database activé, Vault expose plusieurs *endpoints* d’API.
+Cette structure est définie par le plugin (ex: `postgresql-database-plugin`) :
+
+* `database/config/<name>` → configuration d’une connexion DB (plugin, URL, user admin).
+* `database/roles/<role>` → définition d’un rôle Vault : SQL de création d’utilisateurs éphémères, TTL, droits.
+* `database/creds/<role>` → consommation d’un rôle : génère un login/mot de passe temporaire à la demande.
+* `database/static-roles/<role>` → gestion d’un compte fixe dont Vault assure la rotation régulière.
+* `database/rotate-root/<name>` → rotation des credentials administrateur déclarés dans `config/<name>`.
+
+[NOTE]
+====
+La logique est toujours la même :
+
+- **/roles/** = définition de la recette (SQL + TTL)
+- **/creds/** = exécution de cette recette → secrets dynamiques éphémères
+- **/config/** = configuration de la connexion DB elle-même
+====
+
+=== Créer un rôle Vault (SQL embarqué + TTL)
+
+Un **rôle Vault** (ici `app-db-read`) décrit **comment créer** l’utilisateur éphémère et sa **durée de vie**.
+
+[source,bash]
+----
+vault write database/roles/app-db-read \
+  db_name=demo-postgres \
+  creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}';
+                      GRANT CONNECT ON DATABASE demo TO \"{{name}}\";
+                      GRANT USAGE ON SCHEMA public TO \"{{name}}\";
+                      GRANT SELECT ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
+  default_ttl="1h" \
+  max_ttl="24h"
+----
+
+Points clés :
+* **Variables fournies par Vault** dans le SQL :
+* `{{name}}` : nom d’utilisateur généré (unique, traçable)
+* `{{password}}` : mot de passe aléatoire
+* `{{expiration}}` : date d’expiration (selon `default_ttl`/`max_ttl`)
+* `default_ttl`, `max_ttl` : TTL du secret (lease).
+
+* Par défaut, la **révocation** supprimera l’utilisateur (DROP ROLE). Vous pouvez personnaliser :
+
+[source,bash]
+----
+vault write database/roles/app-db-read \
+  db_name=demo-postgres \
+  creation_statements="..." \
+  revocation_statements="REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM \"{{name}}\"; DROP ROLE IF EXISTS \"{{name}}\";" \
+  default_ttl="1h" max_ttl="24h"
+----
+
+(Optionnel) Un rôle **lecture/écriture** :
+
+[source,bash]
+----
+vault write database/roles/app-db-readwrite \
+  db_name=demo-postgres \
+  creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}';
+                      GRANT CONNECT ON DATABASE demo TO \"{{name}}\";
+                      GRANT USAGE ON SCHEMA public TO \"{{name}}\";
+                      GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
+  default_ttl="30m" \
+  max_ttl="8h"
+----
+
+=== Générer des identifiants (lecture = génération)
+
+Lire `database/creds/<role>` **génère** un nouvel utilisateur :
+
+[source,bash]
+----
+vault read database/creds/app-db-read
+----
+
+Exemple de sortie (simplifiée) :
+
+[source,bash]
+----
+Key Value
+
+lease_id database/creds/app-db-read/e1c...9a
+lease_duration 1h
+lease_renewable true
+password Xy7!9abC
+username v-root-app-db-read-1730833381-1
+----
+
+* `lease_id` : identifiant du lease (utile pour renew/revoke)
+* `lease_duration` : TTL initial (ici 1h)
+* `username/password` : **éphémères** ; expirent à `{{expiration}}` (VALID UNTIL).
+
+=== Tester l’accès Postgres
+
+Depuis un Pod outillage ou ta machine (avec `psql`) :
+
+[source,bash]
+----
+export PGHOST=pg.apps.svc.cluster.local
+export PGDATABASE=demo
+export PGUSER="v-root-app-db-read-1730833381-1"   # <- username renvoyé par Vault
+export PGPASSWORD="Xy7!9abC"                      # <- password renvoyé
+psql -c '\du' | head
+psql -c 'SELECT current_user, now();'
+----
+
+=== Cycle de vie du secret (leases)
+
+Lister / renouveler / révoquer :
+
+[source,bash]
+----
+# (1) Générer et capturer le JSON
+vault read -format=json database/creds/app-db-read | tee /tmp/creds.json
+
+# (2) Récupérer le lease_id
+LEASE_ID=$(jq -r .lease_id /tmp/creds.json)
+
+# (3) Renouveler avant expiration (si autorisé et < max_ttl)
+vault lease renew "$LEASE_ID"
+
+# (4) Révoquer immédiatement (DROP ROLE + nettoyage)
+vault lease revoke "$LEASE_ID"
+----
+
+Quand le TTL arrive à échéance (et si non renouvelé), Vault déclenche la **révocation** (par défaut : suppression de l’utilisateur).
+
+== Donner l’accès aux apps (policies + auth + injector/CSI)
+
+=== Policy minimale (lecture du rôle dyn. uniquement)
+
+[source,hcl]
+----
+# app-db.hcl
+path "database/creds/app-db-read" {
+  capabilities = ["read"]
+}
+----
+
+[source,bash]
+----
+vault policy write app-db app-db.hcl
+----
+
+=== Auth Kubernetes (lier SA -> rôle Vault -> policy)
+
+[source,bash]
+----
+# Si pas fait :
+vault auth enable kubernetes
+
+# Config globale kubernetes (API server, CA, reviewer_jwt) - cf. TP précédent
+# vault write auth/kubernetes/config kubernetes_host=... token_reviewer_jwt=... kubernetes_ca_cert=...
+
+# Créer le rôle Vault "app-db" pour les pods avec le SA "sa-app-reader" du ns "apps"
+vault write auth/kubernetes/role/app-db \
+  bound_service_account_names=sa-app-reader \
+  bound_service_account_namespaces=apps \
+  policies="app-db" \
+  ttl=1h
+----
+
+=== Injection côté Pod (sidecar Vault Agent)
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Pod
+metadata:
+  name: injector-db
+  namespace: apps
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "app-db"
+    # Rend le JSON brut renvoyé par /database/creds/app-db-read
+    vault.hashicorp.com/agent-inject-secret-db-creds: "database/creds/app-db-read"
+    # (Optionnel) Mise en forme personnalisée :
+    vault.hashicorp.com/agent-inject-file-db-creds: "db/credentials.json"
+    vault.hashicorp.com/agent-inject-template-db-creds: |
+      {{- with secret "database/creds/app-db-read" -}}
+      {{ toJSON .Data }}
+      {{- end -}}
+spec:
+  serviceAccountName: sa-app-reader
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh","-lc","find /vault/secrets -type f -maxdepth 3 -print -exec echo '----' \\; -exec cat {} \\; ; sleep 3600"]
+----
+
+=== Alternative CSI (montage volume)
+
+Définir un `SecretProviderClass` qui lit `database/creds/app-db-read`, puis monter le volume CSI (cf. section dédiée CSI).
+
+== Rotation des *root creds* (sécurité admin)
+
+Le compte admin (`username=password` dans `database/config/...`) peut être **rotaté** par Vault pour éviter l’exposition :
+
+[source,bash]
+----
+vault write -f database/rotate-root/demo-postgres
+# Vérifier :
+vault read database/config/demo-postgres
+----
+
+== Bonnes pratiques & pièges
+
+* **Ne stockez pas** de `db/password` statique en KV pour la prod → préférez **secrets dynamiques**.
+* Ajoutez `revocation_statements` adaptés à votre politique (DROP ROLE, REVOKE, nettoyage d’objets si besoin).
+* Si vos apps créent de **nouvelles tables** au runtime, pensez aux **default privileges** Postgres (pour donner SELECT/INSERT by default à un rôle).
+* TTL : choisissez `default_ttl` **court** (ex. 15–60 min) et `max_ttl` raisonnable.
+* Sur Kubernetes, préférez **Kubernetes Auth** + **Injector/CSI** pour l’ergonomie et la rotation continue.
+* Activez l’**audit** côté Vault (file/socket) pour tracer la génération/lecture/révocation.
+
+== Résumé
+
+1. *Database engine* ≠ KV : ici, `read` **génère** un secret via un **plugin** (SQL exécuté côté DB).
+2. Vous **configurez** la connexion admin (`database/config/...`).
+3. Vous **définissez** un **rôle Vault** (`database/roles/<role>`) avec :
+* `creation_statements` (SQL de création + droits),
+* `default_ttl` / `max_ttl`,
+* (optionnel) `revocation_statements`, `rollback_statements`, `renew_statements`.
+4. Vous **consommez** via `database/creds/<role>` → `username/password` **éphémères** + `lease`.
+5. Vous **renouvelez/révoquez** via les commandes `lease`.
+6. Vous **exposez** aux apps via **policy + auth method** (K8s OIDC AppRole) et **Injector/CSI**.
+
+
+
+
+
+== Vault — PKI Secrets Engine (vue complète)
+
+=== Définitions fondamentales
+
+* **PKI (Public Key Infrastructure)**
+Une **infrastructure de gestion de clés publiques**.
+Elle regroupe :
+- **Une ou plusieurs Autorités de Certification (CA)** (root et intermédiaires),
+- les **certificats émis** (serveurs, clients, services, etc.),
+- les **mécanismes de validation** (CRL, OCSP, AIA),
+- les **politiques de cycle de vie** (durée de validité, révocation, renouvellement, etc.).
+
+  👉 Ce n’est donc **pas seulement une CA** : c’est **tout l’écosystème** permettant de faire confiance aux certificats.
+
+* **CA (Certificate Authority)**
+Une **entité (ou clé privée)** qui peut **signer des certificats**.
+- Une **Root CA** est auto-signée et constitue la racine de confiance.
+- Une **Intermediate CA** est signée par une autre CA (souvent la Root).
+- Un **Leaf certificate** (serveur ou client) est signé par une CA (souvent intermédiaire).
+
+  👉 Une PKI peut contenir **plusieurs CA** (root + intermédiaires).
+
+* **PKI Secrets Engine dans Vault**
+Vault ne se contente pas de stocker des certificats :
+- il peut **jouer le rôle de CA** (root ou intermédiaire),
+- il peut **signer des CSR** générés ailleurs,
+- il peut **émettre automatiquement des certificats** courts via des rôles,
+- il gère **CRL, OCSP et AIA** (consultation à distance des clés publiques).
+
+  👉 Autrement dit : **Vault fournit une CA fonctionnelle + un service PKI complet** via des endpoints API. La différence essentielle avec une pki est qu'un pki vault n'est associée qu'à un seul certificat. Ce n'est donc qu'un maillon de la chaine de certification.
+
+=== Step by step explanation
+
+==== Créer le mount root pki
+
+[source,bash]
+----
+# On utilise le plugin pki pour créer notre pki root (certificat + capacités supplémentaires d'une pki)
+vault secrets enable -path=pki-root pki
+vault secrets tune -description="Company Root CA" pki-root
+----
+
+vault secrets tune permets de manipuler les paramètres du certificat, voici un exemple exhaustif de ses capacités:
+
+[source,bash]
+----
+vault secrets tune \
+  -description="Root CA PKI" \                 # Description textuelle du secrets engine
+  -default-lease-ttl=8760h \                   # TTL par défaut des secrets (ici 1 an pour les certs)
+  -max-lease-ttl=87600h \                      # TTL maximum autorisé (ici 10 ans pour les certs)
+  -force-no-cache=false \                      # Désactiver (true) ou activer (false) le cache interne des secrets
+  -plugin-version="" \                         # Spécifie la version du plugin s’il y en a un (utile pour plugins externes)
+  -audit-non-hmac-request-keys="" \            # Liste de clés de requête à écrire en clair dans les logs d’audit
+  -audit-non-hmac-response-keys="" \           # Liste de clés de réponse à écrire en clair dans les logs d’audit
+  -passthrough-request-headers="" \            # Liste des en-têtes HTTP que Vault peut transmettre directement au backend
+  -allowed-response-headers="" \               # Liste des en-têtes HTTP autorisés à être retournés par le backend
+  pki-root
+----
+
+[NOTE]
+--
+En pratique on utilise en priorité **-description**, **-default-lease-ttl**, **-max-lease-ttl** et éventuellement **-force-no-cache**, qui désactive le mécanisme de cache interne de vault, afin d'obtenir avec certitude le certificat.
+--
+
+[IMPORTANT]
+--
+les ttl concernent les certificats qui seront créés, cela peut être surchargé par la commande write dans la limite du max-lease-ttl
+--
+
+A ce stade on a notre pki root, que l'on a tunné uniquement par desription conformémement à la remarque précédente
+
+=== Endpoints d’un PKI mount (structure standard)
+
+On appelle notre pki un **mount** PKI. Dès lorsque l'on a un mount pki on dispose des api suivantes. A noter que root/ et intermediate/ sont disponibles, mais il est incohérent de les utiliser sur une même pki.
+
+Voici la vue complète :
+
+[source,bash]
+----
+pki-<name>/
+├── root/
+│   ├── generate/internal
+│   │   # write : génère une Root CA auto-signée
+│   │   # (clé privée conservée par Vault).
+│   │
+│   ├── generate/exported
+│   │   # write : génère une Root CA auto-signée
+│   │   # (clé privée exportée, hors de Vault).
+│   │
+│   └── generate/existing
+│       # write : importe une Root CA déjà existante
+│       # (certificat + clé privée fournis).
+│
+├── intermediate/
+│   ├── generate/internal
+│   │   # write : génère une CSR pour un intermédiaire
+│   │   # (clé privée gérée et stockée dans Vault).
+│   │
+│   ├── generate/exported
+│   │   # write : génère une CSR pour un intermédiaire
+│   │   # (clé privée exportée en dehors de Vault).
+│   │
+│   └── set-signed
+│       # write : importer le certificat signé par une Root
+│       # pour activer l’intermédiaire.
+│
+├── roles/<role_name>
+│   # read/write : définir les règles d’émission des leafs :
+│   #   - TTL min/max
+│   #   - domaines autorisés (CN, SAN)
+│   #   - usages autorisés (serverAuth, clientAuth, etc.)
+│   #   - contraintes diverses (wildcards, etc.)
+│
+├── issue/<role_name>
+│   # write : émet un certificat leaf complet
+│   # (clé + cert + chain) selon les règles du rôle.
+│
+├── sign/<role_name>
+│   # write : signe un CSR externe
+│   # en appliquant les règles du rôle indiqué.
+│
+├── cert/ca
+│   # read : lire le certificat CA actif (root ou intermédiaire).
+│   # Utilisé pour distribuer la chaîne de confiance.
+│
+├── certs/<serial>
+│   # list : liste tous les certificats émis (par numéro de série).
+│   # read : lire un certificat spécifique.
+│
+├── issuers/<issuer_id>
+│   # list : liste tous les issuers (cert+clé) de ce mount.
+│   # read : détail d’un issuer (cert, métadonnées, associations).
+│   # write : config avancée (ex: définir l’issuer par défaut).
+│
+├── config/
+│   ├── ca
+│   │   # read : affiche l’issuer CA par défaut.
+│   │   # write : changer de CA par défaut pour ce mount.
+│   │
+│   ├── urls
+│   │   # read/write : configure les AIA/CRL/OCSP endpoints.
+│   │   # => indispensable pour que les clients TLS puissent
+│   │   # reconstruire la chaîne et valider la révocation.
+│   │
+│   ├── crl
+│   │   # read/write : configure la génération des CRLs
+│   │   # (durée, fréquence, activation/désactivation).
+│   │
+│   └── cluster
+│       # read/write : config cluster HA/multi-DC.
+│       # Synchronisation des CRL/URLs en réplication.
+│
+├── crl
+│   ├── pem
+│   └── der
+│   # read : télécharger la CRL (Certificate Revocation List).
+│   # Contient la liste des certificats révoqués.
+│
+├── ocsp
+│   # read : endpoint OCSP (Online Certificate Status Protocol).
+│   # Permet la vérification en ligne du statut des certificats.
+│
+└── tidy
+    # write : lance le nettoyage des certificats expirés,
+    # clés orphelines et métadonnées devenues inutiles.
+----
+
+=== Créer le root certificate
+
+On créé alors le root certificat associé à notre root pki, c'est ici que l'on spécifie le ttl, très long pour un root, pour ne pas avoir à le renouveller, 10 ans ici.
+
+[source,bash]
+----
+vault write pki-root/root/generate/internal \
+    common_name="Company Root CA" \
+    ttl=87600h
+----
+
+Il est possible de lire le certificat ici
+[source,bash]
+----
+vault read pki-root/cert/ca
+----
+
+=== Création du mount pki intermediate
+
+[source,bash]
+----
+vault secrets enable -path=pki-int pki
+# On configure le max lease
+# Si on ne précise rien il durent 30 jours, sinon c'est max 1 an
+vault secrets tune -description="Company Intermediate CA for .." \
+  -default-lease-ttl=720h \       # 30 jours par défaut
+  -max-lease-ttl=8760h \          # 1 an maximum
+  pki-int
+----
+
+On configure les urls pour qu'ils soient greffés dans les certificats.
+
+[source,bash]
+----
+vault write pki-int/config/urls \
+    issuing_certificates="http://vault.company.local/v1/pki-bpce-tools-int-a/ca" \
+    crl_distribution_points="http://vault.company.local/v1/pki-bpce-tools-int-a/crl" \
+    ocsp_servers="http://vault.company.local/v1/pki-bpce-tools-int-a/ocsp"
+----
+
+Une fois le mount généré on génère sa csr que l'on fait signer par le root ca. Puis on la charge.
+
+.Génération de l'intermediate ca
+[source,bash]
+----
+vault write pki-int/intermediate/generate/internal \
+    common_name="Company Intermediate CA" \
+    ttl=8760h \
+    > pki_intermediate.csr
+----
+
+La csr ressemble ici à quelque chose comme ceci :
+
+[source,bash]
+----
+{ "request_id": "93d77131-547e-4711-d8dd-e4493c9ee1a7", "lease_id": "", "lease_duration": 0, "renewable": false, "data": { "csr": "-----BEGIN CERTIFICATE ... }, "warnings": null, "mount_type": "pki" }
+----
+
+Il faut selectionner uniquement le certificat
+
+[source,bash]
+----
+grep '"csr"' pki_intermediate.csr \
+  | cut -d '"' -f4 \
+  | sed 's/\\n/\n/g' > pki_intermediate.csr
+----
+
+Ou plus simple:
+
+[source,bash]
+----
+vault write pki-int/intermediate/generate/internal \
+    common_name="Company Intermediate CA" \
+    ttl=8760h | jq -r '.data.csr' > pki_intermediate.csr
+----
+
+On signe avec le root CA
+
+[source,bash]
+----
+vault write pki-root/root/sign-intermediate \
+    csr=@pki_intermediate.csr \
+    format=pem_bundle \
+    ttl=43800h \
+    > pki_intermediate.pem
+----
+
+on garde de même uniquement l'intermediate signé
+
+[source,bash]
+----
+jq -r '.data.ca_chain[0]' pki_intermediate_bpce_a.json > intermediate_only.pem
+----
+
+Enfin on importe le ceritifcat signé pour l'intermediate, créant ainsi le haut de la chaine
+
+[source,bash]
+----
+vault write pki-int/intermediate/set-signed certificate=@intermediate_only.pem
+----
+
+Nous avons ici le socle, notre root ca et notre intermediate ca.
+
+=== Configurer le CRL
+
+[source,bash]
+----
+vault write pki-int/config/crl expiry="72h"
+----
+
+Cette commande configure l’endpoint **CRL (Certificate Revocation List)** de la PKI montée à `pki-int`.
+
+L’option `expiry="72h"` signifie :
+
+* Chaque CRL émise par cet intermediate sera valable **72 heures**.
+
+* Quand tu révoques un certificat avec :
+
+[source,bash]
+----
+vault write pki-int/revoke serial_number=...
+----
+Vault marque le certificat comme **revoked**.
+
+* La CRL (fichier listant les certificats révoqués) est régénérée régulièrement.
+* Cette CRL inclut une durée de validité (`Next Update` dans l’extension X.509). Ici : **72h**.
+* Les clients TLS (navigateurs, OpenSSL, Java, etc.) savent qu’ils doivent redemander une CRL à l’URL publiée avant cette échéance.
+
+=== Création du role, template de nos leaf certificats
+
+Voici une version exhaustive des options d'une role, qui est un template pour nos leaf certificats:
+
+[source,bash]
+----
+vault write pki-int/roles/web-servers \
+allowed_domains="rr-dev.dev,*.rr-dev.dev" \        # Domaines autorisés pour les CN/SAN
+allow_subdomains=true \                              # Autorise les sous-domaines si pas explicitement listés
+allow_bare_domains=false \                           # Autorise (ou non) le domaine "nu" (ex: rr-dev.dev sans sous-domaine)
+allow_glob_domains=false \                           # Autorise les glob patterns (ex: *.dev.*)
+allow_wildcard_certificates=true \                   # Autorise les certificats wildcard (*.rr-dev.dev)
+allow_ip_sans=false \                                # Autorise ou interdit les IP dans les SAN
+allow_any_name=false \                               # Autorise n’importe quel CN (⚠️ attention sécurité)
+allow_localhost=false \                              # Autorise "localhost" comme CN/SAN
+key_type="rsa" \                                     # Type de clé par défaut : rsa, ec, ed25519
+key_bits=2048 \                                      # Taille de clé RSA (2048, 3072, 4096)
+key_usage="DigitalSignature,KeyEncipherment" \       # X.509 Key Usage
+ext_key_usage="ServerAuth,ClientAuth" \              # Extended Key Usage : TLS serveur/client
+require_cn=false \                                   # Exige que CN soit présent (sinon SAN uniquement)
+server_flag=true \                                   # Marque le certificat comme utilisable pour un serveur TLS
+client_flag=false \                                  # Marque le certificat comme utilisable pour un client TLS
+enforce_hostnames=true \                             # Vérifie que CN/SAN match un des allowed_domains
+max_ttl="720h" \                                     # TTL max pour les certs émis (ici 30j)
+ttl="168h" \                                         # TTL par défaut si non spécifié (ici 7j)
+no_store=false \                                     # Ne pas stocker le cert dans Vault (utile si confidentialité forte)
+generate_lease=true \                                # Associer un lease à chaque certificat émis
+use_csr_common_name=true \                           # Si CSR fourni : utiliser le CN du CSR
+use_csr_sans=true \                                  # Si CSR fourni : utiliser les SAN du CSR
+allow_spiffe_uri_sans=false \                        # Autorise URI SAN type spiffe://...
+allowed_uri_sans="" \                                # Liste de SAN URI explicitement autorisés
+allowed_user_ids="" \                                # Autoriser des user IDs comme SAN
+allowed_other_sans="" \                              # Liste de SAN "OtherName" autorisés
+allow_wildcard_certificates=true \                   # Autorise *.domain.tld
+enforce_only_sans=false                              # Si true → ignore CN, oblige SAN
+----
+
+On choisit :
+
+[source,bash]
+----
+vault write pki-int/roles/web-servers \
+  allowed_domains="rr-dev.dev,*.rr-dev.dev" \
+  allow_subdomains=true \
+  allow_wildcard_certificates=true \
+  key_type="rsa" \
+  key_bits=2048 \
+  key_usage="DigitalSignature,KeyEncipherment" \
+  ext_key_usage="ServerAuth,ClientAuth" \
+  max_ttl="8760h"
+----
+
+=== Utiliser notre role
+
+On peut désormais créer nos certificats et les utiliser de la façon suivante:
+
+[source,bash]
+----
+vault write -format=json pki-int/issue/web-servers \
+    common_name="app.rr-dev.dev" ttl="720h" > cert.json
+
+jq -r .data.certificate cert.json > cert.pem
+jq -r .data.private_key cert.json > key.pem
+jq -r .data.issuing_ca cert.json > ca.pem
+jq -r '.data.ca_chain[]' cert.json > chain.pem
+----
+
+=== Notions clés
+
+* **PKI mount** : point de montage (ex: `pki/`) qui héberge la CA, les rôles et les endpoints d’émission.
+* **Role PKI** : profil d’émission (noms autorisés, TTL max, SANs…).
+(⚠️ à distinguer des *auth roles*)
+* **Paths principaux** :
+- `pki/root/generate/internal` : générer une **CA racine** interne
+- `pki/intermediate/generate/internal` : générer une **CA intermédiaire** (CSR)
+- `pki/root/sign-intermediate` : signer l’intermédiaire
+- `pki/roles/<role>` : déclarer un profil d’émission
+- `pki/issue/<role>` : émettre un **leaf certificate**
+- `pki/revoke` : révoquer un certificat
+- `pki/config/urls` : publier les URLs (CRL, AIA)
+- `pki/tidy` : nettoyage CRL/objets expirés
+
+
+=== Policies minimales (séparation émission vs config)
+
+[source,hcl]
+----
+# Émettre des certs (apps)
+path "pki/issue/xxx" {
+  capabilities = ["update"]
+}
+
+# Voir la CA (optionnel pour chaînage)
+path "pki/ca" {
+  capabilities = ["read"]
+}
+
+# ADMIN PKI (ops uniquement)
+path "pki/roles/*" { capabilities = ["read", "update", "list"] }
+path "pki/*"       { capabilities = ["read", "update"] } # si besoin, plus granulaire
+----
+[NOTE]
+====
+Ne donne **jamais** à une app l’accès en écriture sur `pki/roles/*` : elle pourrait élargir les CN/SAN autorisés.
+====
+
+== Automatisation du TLS dans K8S (Ingress, IngressRoute, GatewayAPI)
+
+L'automatisation repose entièrement sur la relation entre cert-manager et vault. vault doit être reconnu comme ayant la capacité à signer les certificats auprès de cert-manager, et cert-manager doit être autorisé par vault à les signer. Cette double relation de confiance s'établit comme ceci :
+
+
+=== Étape 1 : activer l’authentification Kubernetes
+
+En introduction nous devons fournir à vault la capacité de vérifier les token présentés afin de vérifier la validité. Pour ce faire nous devons activer l'authentification kubernetes dans vault et lui fournir le service account utilisé par vault, le endpoint l'api-server
+
+[source,bash]
+----
+vault auth enable kubernetes
+----
+
+Cela crée le moteur d’auth à l’emplacement `auth/kubernetes/`.
+
+=== Configurer Vault pour dialoguer avec Kubernetes
+
+[source,bash]
+----
+vault write auth/kubernetes/config \
+    kubernetes_host="https://$KUBERNETES_PORT_443_TCP_ADDR:443" \
+    kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+    token_reviewer_jwt="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+----
+
+On fournit à vault :
+
+* **kubernetes_host**: c'est l'ip ou le service de l'api server, en utilisant la variable d'environnement on utilise l'ip, c'est grâce à cela que vault sait ou envoyer ses demandes
+* **token_reviewer_jwt**: C'est le token que vault fournit pour attester du fait qu'il a le droit de vérifier les tokens. En amont vault créé un service account vault qu'il monte sur son pod. En parrallèle il a créé un rolebinding qui donne le role `system:auth-delegator`, c'est ce rôle qui donne le droit à vault de créer des tokenreview, qui permettent de vérifier les tokens.
+* **kubernetes_ca_cert**: le certificat root est nécessaire à l'établissement d'une connexion sécurisé à l'instar de n'importe quel connexion sécurisé qui doit avoir dans son trust store local le certificat racine. Cela permets de vérifier que c'est bien le root ca associé qui a signé le certificat présenté par l'api server.
+
+Avec cette combinaison, vault est en mesure d'établir une connexion sécurisée avec l'api server, afin de vérifier l'authenticité des tokens.
+
+=== ClusterIssuer & Issuer : le lien entre cert-manager et Vault
+
+Un `ClusterIssuer` (non namespaced) ou un `Issuer` est un **objet Kubernetes (CRD)** fourni par *cert-manager*.
+Il définit une **autorité de certification (AC)** utilisable dans tout le cluster et encapsule la façon dont les certificats doivent être obtenus :
+
+* **AC publique** (ex: Let's Encrypt via ACME),
+* **AC interne** (ex: Vault PKI, Venafi, CA locale),
+* **ou un Secret K8s** contenant directement une clé signataire.
+
+En résumé, c’est le **lien entre cert-manager et Vault** dans notre architecture.
+
+=== Pourquoi en avons-nous besoin ?
+
+Notre Vault sait signer des certificats via l’endpoint :
+
+[source,bash]
+----
+vault write pki-.../sign/web-servers ...
+----
+
+Mais les objets Kubernetes (Ingress, IngressRoute, Gateway API) ne savent pas parler directement à Vault.
+C’est là que *cert-manager* intervient :
+
+. Détecte qu’un objet `Certificate` est créé.
+. Lit la référence `issuerRef`.
+. Appelle le `ClusterIssuer` ou l'`Issuer` (ici → Vault).
+. Récupère le certificat émis (cert + clé + CA).
+. Stocke le tout dans un Secret Kubernetes (`tls.crt`, `tls.key`, `ca.crt`).
+
+Ainsi, les composants K8s n’ont plus besoin d’appeler Vault directement :
+ils consomment simplement les Secrets TLS générés et mis à jour automatiquement.
+
+Plutôt que de setter manuellement les certificats dans tous nos ingress, on utilisera cert-manager pour qu'il s'occupe de la rotation des certificats.
+
+=== Création de l'issuer
+
+On créé tout d'abord le service account qui sera présenté par l'issuer (c'est lui qui fera la demande de signature, c'est lui qui sera présenté à vault, c'est donc à lui qu'il faudra donner les bon roles vault).
+
+[source,bash]
+----
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: issuer-sa
+  namespace: <namespace_pour_le_cert>
+----
+
+Dans le cas d'un clusterIssuer, le namespace dans lequel créer le service account utilisé est celui mis au démarrage du cert-manager via l'option **--cluster-resource-namespace**
+
+.si on veut un issuer
+[source,bash]
+----
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: issuer-sa
+  namespace: <namespace_cluster_ressource>
+----
+
+.si on veut un cluster issuer
+[source,bash]
+----
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: issuer-sa
+  namespace: cert-manager # à vérifier côté param cert-manager
+----
+
+Lorsque cert-manager tentera de signer un certificat, il créera tout d'abord un token pour ce service account, et présentera ce token à vault, il faut donc lui donner à cert-manager via son serviceaccount cert-manager de créer des token pour le service account issuer-sa. En clusterIssuer, le serviceaccount de l'issuer est créé dans le namespace cert-manager, donc devrait avoir les droits pour créer des service account, mais on peut le créer tout de meme par souci de propreté.
+
+.role en clusterIssuer
+[source,bash]
+----
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: issuer-sa-tokenrequest
+  namespace: cert-manager
+rules:
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  verbs: ["create"]
+----
+
+.en issuer
+[source,bash]
+----
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: issuer-sa-tokenrequest
+  namespace: <namespace_de_lissuer>
+rules:
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  verbs: ["create"]
+----
+
+.enc clusterIssuer
+[source,yaml]
+----
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: issuer-sa-tokenrequest
+  namespace: cert-manager
+rules:
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  verbs: ["create"]
+----
+
+.rolebinding
+[source,yaml]
+----
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: issuer-sa-tokenrequest
+  namespace: <namespace_de_lissuer_ou_cert-manager>
+subjects:
+- kind: ServiceAccount
+  name: cert-manager
+  namespace: cert-manager
+roleRef:
+  kind: Role
+  name: issuer-sa-tokenrequest
+  apiGroup: rbac.authorization.k8s.io
+----
+
+Avant de créer l'issuer il nous nous assurer que le service account qui sera présenté par cert-manager aura bien les droits pour signer des certificats depuis notre pki intermédiaire.
+
+=== Création de la policy vault
+
+Il faut que notre token vault puisse signer les csr, et consulter le certificat publique de la pki intermédiaire.
+
+[source,bash]
+----
+# On autorise la signature des certificate depuis l'intermédiate
+echo -e 'path "pki-int/sign/web-servers" {\n  capabilities = ["update"]\n}\n' > pki-cert-manager.hcl
+
+# On autorise consultation des certificats
+echo -e 'path "pki-int/ca" {\n  capabilities = ["read"]\n}' >> pki-cert-manager.hcl
+
+# Vérification
+cat pki-cert-manager.hcl
+
+# Application de la policy dans Vault
+vault policy write pki-cert-manager pki-cert-manager.hcl
+----
+
+.fichier pki-cert-manager.hcl
+[source,bash]
+----
+path "pki-bpce-tools-int-a/sign/web-servers" {
+  capabilities = ["update"]
+}
+
+path "pki-bpce-tools-int-a/ca" {
+  capabilities = ["read"]
+}
+----
+
+A ce stade nous avons les bonnes policies d'un côté, et nous avons de l'autre côté un service account sera présenté. Mais ce service account ne dispose pas encore de cette policy, le lien n'est pas fait.
+
+=== Création du rôle vault pour cert-manager
+
+Nous venons de créer la policy, il faut maintenant la rattacher aux services account qui proviendront de cert-manager. Nous créer un rôle dans l'auth kubernetes (`auth/kubernetes/role`) et nous l'appelons `cert-manager`.
+
+[source,bash]
+----
+vault write auth/kubernetes/role/cert-manager \
+    bound_service_account_names=<issuer_service_account> \
+    bound_service_account_namespaces=<issuer_namespace> \
+    policies=pki-cert-manager \
+    ttl=24h \
+    audience="vault://<issuer_namespace>/<issuer_service_account>" \
+----
+
+==== Explications
+
+Cette commande crée un rôle d’authentification Kubernetes dans Vault (`auth/kubernetes/role/cert-manager`).
+
+* **`bound_service_account_names=issuer_service_account`**
+Seuls les pods qui utilisent le ServiceAccount nommé `issuer_service_account`. Pour nous c'est issuer-sa.
+
+* **`bound_service_account_namespaces=cert-manager`**
+…et qui tournent dans le namespace `issuer_namespace`…. Pour nous c'est soit `cert-manager` dans le cas d'un clusterIssuer, soit le namespace de l'Issuer (sur lequel nous avons créé notre service account).
+
+…sont autorisés à utiliser ce rôle.
+Cela agit comme un **garde-fou** pour éviter qu’un autre pod du cluster ne s’authentifie.
+
+* **`policies=pki-cert-manager`**
+
+Le token Vault émis sera attaché à la policy `pki-cert-manager`, qui contient par exemple :
+[source,hcl]
+----
+path "pki-bpce-tools-int-a/sign/web-servers" {
+capabilities = ["update"]
+}
+----
+
+→ Concrètement, cela autorise cert-manager à demander la signature de certificat signing requests.
+
+* **`ttl=24h`**
+Le token Vault obtenu expirera automatiquement au bout de 24 heures.
+cert-manager se charge de renouveler un nouveau token si nécessaire.
+
+* **`audience=vault://<issuer_namespace>/<issuer_name>`**
+
+Vault vérifie que le JWT du ServiceAccount contient bien `aud: "vault://<issuer_namespace>/<issuer_name>"`. Cette audience est fournit définie par l'issuer et donc par cert manager lorsqu'il tente de communiquer avec vault. C'est écrit dans la documentation officielle sous la forme suivante:
+
+[source,bash]
+----
+The audience allows you to restrict the Vault role to a single Issuer or ClusterIssuer. The syntax is the following:
+
+"vault://<namespace>/<issuer-name>"   # For an Issuer.
+"vault://<cluster-issuer-name>"       # For a ClusterIssuer.
+----
+
+Cela évite qu’un jeton généré pour le serveur API Kubernetes soit réutilisé pour s’authentifier à Vault.
+Cette option est une **mesure de sécurité** et deviendra obligatoire à partir de Vault ≥ 1.21.
+
+[IMPORTANT]
+--
+Ici pour continuer nous devonss donc fixer le nom de notre issuer, nous l'appelerons vault-issuer-rr-dev-dev.
+--
+
+Autrement dit pour nous l'audience est soit `vault://<namespace_de_lissuer>/vault-issuer-rr-dev-dev` soit `vault://vault-issuer-rr-dev-dev`
+
+=== Création de l'issuer
+
+On créé ensuite l'issue ou le cluster issuer. C'est la brique manquante.
+
+[source,bash]
+----
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: vault-issuer-rr-dev-dev
+  namespace: kube-system
+spec:
+  vault:
+    server: "http://vault.vault.svc.cluster.local:8200"
+    path: "pki-int/sign/web-servers"
+    auth:
+      kubernetes:
+        mountPath: /v1/auth/kubernetes
+        role: cert-manager
+        serviceAccountRef:
+          name: issuer-sa
+----
+
+.clusterIssuer
+[source,bash]
+----
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: vault-issuer-rr-dev-dev
+spec:
+  vault:
+    server: "http://vault.vault.svc.cluster.local:8200"
+    path: "pki-int/sign/web-servers"
+    auth:
+      kubernetes:
+        mountPath: /v1/auth/kubernetes
+        role: cert-manager
+        serviceAccountRef:
+          name: issuer-sa
+----
+
+=== Création d'un certificat à l'aide du clusterIssuer ou de l'issuer
+
+.clusterissuer
+[source,bash]
+----
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-rr-dev
+  namespace: apps
+spec:
+  secretName: wildcard-rr-dev-dev-tls
+  commonName: "*.rr-dev.dev"
+  dnsNames:
+    - "*.rr-dev.dev"
+  issuerRef:
+    name: vault-issuer-rr-dev
+    kind: ClusterIssuer
+----
+
+.issuer
+[source,bash]
+----
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-rr-dev
+  namespace: <bon_namespace_de_lissuer>
+spec:
+  secretName: wildcard-rr-dev-dev-tls
+  commonName: "*.rr-dev.dev"
+  dnsNames:
+    - "*.rr-dev.dev"
+  issuerRef:
+    name: vault-issuer-rr-dev
+    kind: Issuer
+----
