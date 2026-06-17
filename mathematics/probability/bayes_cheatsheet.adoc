@@ -1,0 +1,480 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+
+= Fiche pratique — Utiliser Bayes en pratique
+
+== Schéma mental fondamental
+
+Bayes s’utilise toujours selon le même schéma :
+
+----
+Hypothèse probabiliste sur θ
+→ observation de données
+→ loi postérieure sur θ
+→ E[θ | D] et Var(θ | D)
+→ décision
+----
+
+Bayes ne fournit pas une vérité, mais une distribution sur l’incertitude.
+
+== Principe général
+
+On pose :
+
+----
+θ ~ Loi(a priori)
+----
+
+Après observation des données D :
+
+----
+θ | D ~ Loi(postérieure)
+----
+
+La postérieure est ensuite exploitée via :
+
+- son espérance (estimation centrale)
+- sa variance (incertitude, robustesse)
+- éventuellement ses quantiles
+
+== Guide par type de problème
+
+=== Probabilité de succès / conversion / adoption
+
+Cas d’usage :
+- funnel produit
+- MVP
+- taux de conversion
+- probabilité d’adoption
+
+Hypothèse naturelle :
+
+----
+P ~ Beta(a, b)
+----
+
+Mise à jour (k succès sur n essais) :
+
+----
+P | D ~ Beta(a + k, b + n − k)
+----
+
+Espérance :
+
+----
+E[P | D] = (a + k) / (a + b + n)
+----
+
+Variance :
+
+----
+Var(P | D) = ((a + k)(b + n − k))
+             / ((a + b + n)^2 (a + b + n + 1))
+----
+
+À retenir :
+- a + b = force de la croyance initiale
+- a priori faible ⇒ données dominantes
+- la variance décroît avec n
+
+=== Moyenne réelle inconnue (Normal / Normal)
+
+Cas d’usage :
+- métrique moyenne
+- performance
+- score utilisateur
+- A/B tests
+
+Hypothèse :
+
+----
+μ ~ Normal(μ₀, τ₀²)
+----
+
+(variance d’observation σ² supposée connue)
+
+Mise à jour :
+
+----
+μ | D ~ Normal(μₙ, τₙ²)
+----
+
+avec :
+
+----
+τₙ² = (1/τ₀² + n/σ²)^(-1)
+μₙ  = τₙ² · (μ₀/τ₀² + n·X̄/σ²)
+----
+
+Espérance :
+
+----
+E[μ | D] = μₙ
+----
+
+Variance :
+
+----
+Var(μ | D) = τₙ²
+----
+
+=== Comptages / fréquences (Poisson / Gamma)
+
+Cas d’usage :
+- logs
+- erreurs
+- événements par unité de temps
+- monitoring
+
+Hypothèse :
+
+----
+λ ~ Gamma(α, β)
+----
+
+Modèle d’observation :
+
+----
+K | λ ~ Poisson(λ)
+----
+
+Mise à jour (S = somme des comptages, n périodes) :
+
+----
+λ | D ~ Gamma(α + S, β + n)
+----
+
+Espérance :
+
+----
+E[λ | D] = α / β
+----
+
+Variance :
+
+----
+Var(λ | D) = α / β²
+----
+
+=== Temps avant événement (Exponentielle / Gamma)
+
+Cas d’usage :
+- temps avant churn
+- durée d’usage
+- temps avant panne
+
+Hypothèse :
+
+----
+λ ~ Gamma(α, β)
+----
+
+Modèle :
+
+----
+T | λ ~ Exponentielle(λ)
+----
+
+Mise à jour (T = somme des temps observés) :
+
+----
+λ | D ~ Gamma(α + n, β + T)
+----
+
+Espérance :
+
+----
+E[λ | D] = α / β
+----
+
+Variance :
+
+----
+Var(λ | D) = α / β²
+----
+
+=== Variance inconnue (Inverse-Gamma)
+
+Cas d’usage :
+- risque
+- dispersion
+- volatilité
+- bruit
+
+Hypothèse :
+
+----
+σ² ~ Inverse-Gamma(α, β)
+----
+
+Mise à jour :
+
+----
+σ² | D ~ Inverse-Gamma(α + n/2, β + ½∑(xᵢ − μ)²)
+----
+
+Espérance (si α > 1) :
+
+----
+E[σ² | D] = β / (α − 1)
+----
+
+Variance (si α > 2) :
+
+----
+Var(σ² | D) = β² / ((α − 1)² (α − 2))
+----
+
+== Cas non conjugués
+
+Pour certaines lois (ex. Weibull) :
+
+- il n’existe pas de forme fermée
+- la postérieure doit être estimée numériquement
+- on utilise Monte Carlo (MCMC), approximation ou quadrature
+
+Le principe bayésien reste strictement identique.
+
+== Règles d’or pour utiliser Bayes correctement
+
+1. Toujours poser une hypothèse probabiliste explicite
+2. Utiliser un a priori faible en cas de doute
+3. Ne jamais regarder l’espérance seule
+4. Toujours analyser la variance
+5. Raisonner en distributions, jamais en valeurs ponctuelles
+6. Mettre à jour itérativement (Bayes est fait pour apprendre)
+
+== Résumé fondamental
+
+Bayes est un opérateur mathématique qui transforme :
+
+----
+a priori + données → postérieure
+----
+
+Ce qu’on exploite réellement ensuite :
+
+- l’espérance (décision moyenne)
+- la variance (incertitude, robustesse)
+- parfois les quantiles (pire cas)
+
+Bayes n’est pas un outil de vérité,
+c’est un outil de gestion rationnelle de l’incertitude.
+
+== Exemples d’utilisation par loi
+
+=== Exemple 1 — Probabilité de conversion (Beta / Binomiale)
+
+Contexte :
+On mesure la probabilité qu’un utilisateur convertisse après exposition à un produit.
+
+Hypothèse a priori :
+
+----
+P ~ Beta(1, 1)
+----
+
+(Test non informatif)
+
+Données observées :
+- n = 200 visiteurs
+- k = 5 conversions
+
+Mise à jour bayésienne :
+
+----
+P | D ~ Beta(1 + 5, 1 + 195) = Beta(6, 196)
+----
+
+Espérance :
+
+----
+E[P | D] = 6 / 202 ≈ 2.97 %
+----
+
+Variance :
+
+----
+Var(P | D) ≈ 0.00014
+----
+
+Interprétation :
+La conversion moyenne estimée est ~3 %, avec une incertitude encore significative.
+La faible taille de l’échantillon limite la confiance.
+
+---
+
+=== Exemple 2 — Valeur moyenne inconnue (Normal / Normal)
+
+Contexte :
+On mesure le temps moyen (en secondes) pour accomplir une tâche.
+
+Hypothèse a priori :
+
+----
+μ ~ Normal(60, 10²)
+----
+
+(On pense que la tâche prend ~1 minute)
+
+Données observées :
+- n = 25 utilisateurs
+- moyenne observée X̄ = 52
+- variance d’observation σ² = 16
+
+Mise à jour :
+
+----
+τₙ² = (1/100 + 25/16)⁻¹ ≈ 0.63
+μₙ  ≈ 52.5
+----
+
+Postérieure :
+
+----
+μ | D ~ Normal(52.5, 0.63)
+----
+
+Interprétation :
+Le temps moyen est révisé fortement à la baisse,
+avec une incertitude devenue faible grâce aux données.
+
+---
+
+=== Exemple 3 — Comptage d’événements (Poisson / Gamma)
+
+Contexte :
+On mesure le nombre d’erreurs applicatives par jour.
+
+Hypothèse a priori :
+
+----
+λ ~ Gamma(2, 1)
+----
+
+(Doute faible, mais erreurs rares)
+
+Données observées :
+- 10 jours
+- 18 erreurs au total
+
+Mise à jour :
+
+----
+λ | D ~ Gamma(2 + 18, 1 + 10) = Gamma(20, 11)
+----
+
+Espérance :
+
+----
+E[λ | D] ≈ 1.82 erreurs / jour
+----
+
+Variance :
+
+----
+Var(λ | D) ≈ 0.165
+----
+
+Interprétation :
+Le taux d’erreur est désormais bien estimé,
+avec une dispersion modérée.
+
+---
+
+=== Exemple 4 — Temps avant churn (Exponentielle / Gamma)
+
+Contexte :
+On mesure le temps avant qu’un utilisateur quitte le service.
+
+Hypothèse a priori :
+
+----
+λ ~ Gamma(1, 1)
+----
+
+(Aucun a priori fort)
+
+Données observées :
+- n = 15 utilisateurs churnés
+- somme des durées observées T = 120 jours
+
+Mise à jour :
+
+----
+λ | D ~ Gamma(1 + 15, 1 + 120) = Gamma(16, 121)
+----
+
+Espérance :
+
+----
+E[λ | D] ≈ 0.132
+----
+
+Durée moyenne estimée :
+
+----
+E[T] = 1 / E[λ] ≈ 7.6 jours
+----
+
+Interprétation :
+Les utilisateurs churnent en moyenne après ~1 semaine,
+avec une incertitude modérée.
+
+---
+
+=== Exemple 5 — Variance inconnue (Inverse-Gamma)
+
+Contexte :
+On estime la variance d’une métrique instable (latence, score).
+
+Hypothèse a priori :
+
+----
+σ² ~ Inverse-Gamma(2, 50)
+----
+
+Données observées :
+- n = 30 mesures
+- somme des écarts au carré = 900
+
+Mise à jour :
+
+----
+σ² | D ~ Inverse-Gamma(2 + 15, 50 + 450)
+----
+
+Soit :
+
+----
+σ² | D ~ Inverse-Gamma(17, 500)
+----
+
+Espérance :
+
+----
+E[σ² | D] = 500 / 16 ≈ 31.25
+----
+
+Interprétation :
+La variance est désormais bien contrainte,
+ce qui permet d’évaluer le risque et la stabilité.
+
+== Lecture transversale
+
+Tous les exemples suivent le même schéma :
+
+----
+Hypothèse probabiliste
+→ données observées
+→ postérieure
+→ espérance + variance
+→ interprétation décisionnelle
+----
+
+Changer de loi ne change pas la logique,
+seulement la nature de ce que l’on mesure.
