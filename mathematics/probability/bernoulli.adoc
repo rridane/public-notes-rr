@@ -1,0 +1,450 @@
+= Loi de Bernoulli
+:toc:
+:toclevels: 3
+:sectnums:
+
+== Définition de la loi de Bernoulli
+
+Une variable aléatoire suit une loi de Bernoulli si elle modélise une expérience
+à deux issues possibles : succès ou échec.
+
+On note :
+
+----
+X ~ Bernoulli(p)
+
+# lire X "suit une loi" "Bernoulli de paramètre p"
+# Le symbole "~" signifie "suit la loi de".
+----
+
+où :
+
+* p ∈ [0,1] est la probabilité de succès
+* 1 − p est la probabilité d’échec
+
+IMPORTANT : ou *p est un paramètre fixé et inconnu*, pas une variable aléatoire.
+
+== Support de la variable aléatoire
+
+La variable aléatoire X ne peut prendre que deux valeurs :
+
+----
+X ∈ {0, 1}
+----
+
+* X = 1 : succès
+* X = 0 : échec
+
+== Fonction de masse de probabilité (PMF)
+
+La loi de Bernoulli est définie par :
+
+----
+P(X = 1) = p
+P(X = 0) = 1 − p
+----
+
+On peut regrouper ces deux cas dans une *forme compacte* :
+
+----
+P(X = x) = p^x (1 − p)^(1 − x),   x ∈ {0,1}
+----
+
+=== Explication
+
+Cette écriture permet d’encoder les deux cas possibles sans condition "si / alors".
+
+* Si x = 1 :
+----
+p^1 (1 − p)^0 = p
+----
+
+* Si x = 0 :
+----
+p^0 (1 − p)^1 = 1 − p
+----
+
+Les exposants jouent le rôle d’interrupteurs algébriques :
+un terme est activé (exposant = 1) ou neutralisé (exposant = 0).
+
+Cette forme est fondamentale car elle :
+
+* se multiplie naturellement
+* permet l’addition des preuves
+* rend la mise à jour bayésienne calculable
+
+== Espérance (moment d’ordre 1)
+
+L’espérance est définie par :
+
+----
+E[X] = Σ x · P(X = x)
+----
+
+Pour une Bernoulli :
+
+----
+E[X] = 0 · (1 − p) + 1 · p = p
+----
+
+Donc :
+
+----
+E[X] = p
+----
+
+Interprétation :
+la moyenne théorique d’une Bernoulli est égale à la probabilité de succès.
+
+[NOTE]
+--
+Intuitivement on perçoit la logique, supposons qu'on ait 7 fois sur 10 un 1, et 3 fois sur 10 un 0. Alors la probabilité d'avoir un 1 est de 0,7. Mais c'est également ce que nous aurons comme moyenne à long terme si l'on répète 100 fois l'exercice. On espère ( aus sens de on devrait avoir comme moyenne) 70/100 soit 0,7.
+--
+
+== Moments et variance
+
+=== Moments statistiques - Définition
+
+Le moment d’ordre k d’une variable aléatoire X est :
+
+----
+E[X^k]
+----
+
+* Moment d’ordre 1 : position centrale (moyenne)
+* Moment d’ordre 2 : dispersion brute
+* Moments centrés : description de la forme autour de la moyenne
+
+
+=== Moments centrés — définition
+
+Soit X une variable aléatoire telle que son espérance existe et soit :
+
+----
+μ = E[X]
+----
+
+On appelle *moment centré d’ordre k* de X la quantité :
+
+----
+μ_k = E[(X − μ)^k]
+----
+
+Autrement dit, un moment centré est le moment de la variable *centrée* :
+
+----
+X_c = X − E[X]
+----
+
+élevée à la puissance k.
+
+=== Interprétation des premiers moments centrés
+
+* Moment centré d’ordre 1 :
+----
+E[X − E[X]] = 0
+----
+Il est toujours nul par construction.
+
+* Moment centré d’ordre 2 :
+----
+E[(X − E[X])^2]
+----
+Il mesure la dispersion de X autour de sa moyenne et est appelé *variance*.
+
+* Moment centré d’ordre 3 :
+----
+E[(X − E[X])^3]
+----
+Il mesure l’asymétrie de la distribution (skewness).
+
+* Moment centré d’ordre 4 :
+----
+E[(X − E[X])^4]
+----
+Il mesure la concentration de la distribution autour de la moyenne (kurtosis).
+
+=== Différence entre moments bruts et moments centrés
+
+Les moments bruts sont définis par :
+
+----
+E[X^k]
+----
+
+Ils décrivent la distribution par rapport à l’origine 0.
+
+Les moments centrés sont définis par :
+
+----
+E[(X − E[X])^k]
+----
+
+Ils décrivent la distribution par rapport à sa valeur centrale intrinsèque.
+
+=== Variance (moment centré d'ordre 2) — définition et forme équivalente
+
+==== Définition fondamentale
+
+Soit X une variable aléatoire telle que son espérance existe et soit :
+
+----
+μ = E[X]
+----
+
+La variance de X est définie par le *moment centré d’ordre 2* :
+
+----
+Var(X) = E[(X − μ)^2]
+
+# <=> Var(X) = E[(X − E[X])^2]
+----
+
+Cette définition mesure la distance quadratique moyenne de X à sa valeur centrale.
+
+==== Condition d’existence
+
+La variance de X est définie si et seulement si le moment d’ordre 2 existe :
+
+----
+E[X^2] < +∞
+----
+
+Sans cette condition, la variance n’existe pas.
+
+==== Forme algébrique équivalente
+
+Lorsque le second moment existe, la variance admet la forme équivalente :
+
+----
+Var(X) = E[X²] − (E[X])²
+----
+
+==== Démonstration de l’équivalence
+
+On part de la définition fondamentale :
+
+----
+Var(X) = E[(X − E[X])²]
+----
+
+Posons :
+
+----
+μ = E[X]
+----
+
+Développons le carré :
+
+----
+(X − μ)² = X² − 2μX + μ²
+----
+
+Appliquons l’espérance terme à terme (linéarité de E) :
+
+----
+E[(X − μ)²]
+= E[X²] − 2μE[X] + μ²
+----
+
+Or, par définition :
+
+----
+E[X] = μ
+----
+
+Donc :
+
+----
+E[(X − μ)²]
+= E[X²] − 2μ² + μ²
+= E[X²] − μ²
+----
+
+On obtient ainsi :
+
+----
+Var(X) = E[X²] − (E[X])²
+----
+
+==== Interprétation
+
+* E[(X − μ)²] est une définition géométrique : dispersion autour de la moyenne.
+* E[X²] − μ² est une forme algébrique : séparation position / dispersion.
+
+Les deux expressions décrivent exactement le même objet.
+
+== Var(X) pour une loi de Bernoulli
+
+=== Définition
+
+Pour une Bernoulli :
+
+----
+Var(X) = p(1 − p)
+----
+
+La variance est maximale pour p = 0.5 et nulle pour p = 0 ou p = 1.
+
+=== Démonstration
+
+Soit X une variable aléatoire suivant une loi de Bernoulli de paramètre p :
+
+----
+X ~ Bernoulli(p)
+----
+
+c’est-à-dire :
+
+----
+P(X = 1) = p
+P(X = 0) = 1 − p
+----
+
+=== Formule générale de la variance
+
+Pour toute variable aléatoire X, la variance est définie par :
+
+----
+Var(X) = E[X²] − (E[X])²
+----
+
+=== Calcul de E[X]
+
+Par définition :
+
+----
+E[X] = Σ x · P(X = x)
+----
+
+Pour une Bernoulli :
+
+----
+E[X] = 0 · (1 − p) + 1 · p = p
+----
+
+=== Calcul de E[X²]
+
+Pour une variable de Bernoulli, on observe que :
+
+----
+X² = X
+----
+
+car :
+
+* 0² = 0
+* 1² = 1
+
+Donc :
+
+----
+E[X²] = E[X] = p
+----
+
+=== Calcul de la variance
+
+En appliquant la formule générale :
+
+----
+Var(X) = E[X²] − (E[X])²
+       = p − p²
+       = p(1 − p)
+----
+
+=== Conclusion
+
+La variance d’une variable aléatoire suivant une loi de Bernoulli(p) est :
+
+----
+Var(X) = p(1 − p)
+----
+
+Cette expression montre que :
+
+* la variance est nulle pour p = 0 ou p = 1
+* la variance est maximale pour p = 0.5
+* l’incertitude est maximale lorsque le succès est le plus indéterminé
+
+== Propriété clé : X^k = X
+
+Pour une variable de Bernoulli :
+
+----
+X^k = X   pour tout k ≥ 1
+----
+
+Donc :
+
+----
+E[X^k] = p
+----
+
+Tous les moments bruts sont égaux à p, mais la variance reste non nulle
+car elle dépend du recentrage autour de la moyenne.
+
+== Plusieurs observations Bernoulli
+
+=== Hypothèses d'observations
+
+Considérons n observations :
+
+----
+X₁, X₂, …, Xₙ
+----
+
+où chaque Xᵢ suit une loi Bernoulli(p).
+
+=== Hypothèse d’indépendance
+
+On suppose que les variables aléatoires sont indépendantes :
+
+----
+P(X₁ = x₁, …, Xₙ = xₙ)
+= ∏ᵢ P(Xᵢ = xᵢ)
+----
+
+Cette hypothèse est équivalente à :
+
+----
+P(Xᵢ | Xⱼ) = P(Xᵢ)   pour i ≠ j
+----
+
+Aucune observation ne modifie la probabilité d’une autre.
+
+=== Probabilité conjointe des observations
+
+En utilisant la forme compacte de la Bernoulli :
+
+----
+P(X₁ = x₁, …, Xₙ = xₙ)
+= ∏ᵢ p^(xᵢ) (1 − p)^(1 − xᵢ)
+----
+
+En regroupant les termes :
+
+----
+= p^(Σ xᵢ) (1 − p)^(n − Σ xᵢ)
+----
+
+La somme :
+
+----
+S = Σ xᵢ
+----
+
+est la *statistique suffisante* du modèle :
+elle contient toute l’information pertinente des données.
+
+== Conclusion intermédiaire
+
+À ce stade :
+
+* Bernoulli modélise une observation élémentaire
+* l’indépendance permet la factorisation
+* la somme des observations apparaît naturellement
+* la loi binomiale est prête à émerger
+
+La prochaine étape logique est de dériver explicitement la loi binomiale
+ou de transformer p en variable aléatoire (loi Beta).
+
