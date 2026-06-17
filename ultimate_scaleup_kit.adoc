@@ -1,0 +1,120 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+
+= Ultimate Scale-up Kit
+
+Cette fiche présente un socle technique complet pensé pour armer une start-up et lui permettre d'encaisser rapidement une explosion de trafic et de recrutement, tout en gardant qualité, rapidité de développement et robustesse de la plateforme.
+
+== 🔐 Sécurité & Secrets
+
+* **Vault**
+** Gestion centralisée de tous les secrets.
+** Injection en variables d’environnement ou fichiers via K8s secrets.
+** AuthN via OIDC (Keycloak) ou injection.
+** Tokens courts + rotation automatique.
+
+* **external secrets**
+** Création automatique des secrets à partir de vault
+
+* **OPA (Open Policy Agent)**
+** Drop de capabilities.
+** Règles root/admin déclaratives.
+
+== 🏗️ Infrastructure & Réseau
+
+* **Harbor** : registry privé avec images scannées et signées.
+* **Calico** : politiques réseau (ingress/egress), Zero Trust policy, tout est fermé par défaut.
+* **Istio (Envoy)** : service mesh avancé :
+** Retry, timeout, circuit breaking, rate limiting.
+* **HAProxy + Keepalived** : HA en entrée.
+* **Bind9** : DNS interne.
+* **Séparation du trafic interne / externe**
+** Ingress controllers distincts (public / private) OU entryPoints séparés.
+** VIP publique pour les applis exposées, VIP interne pour les services internes.
+
+== 🔑 Identité & Authentification
+
+* **Keycloak + OIDC**
+** Authentification unifiée pour toutes les apps et services.
+** Gestion des realms, routes, certificats et DNS via Terraform.
+
+== 📦 Déploiement & Bases de Données
+
+* **Cloudnative PG as a Service** (via Terraform).
+* **Pipeyard** : Intégration 100% automatisée avec Pipeyard, dora metrics
+* **Terraform CD + Atom** : déploiement 100% automatisé.
+* **Releases fines orchestrées avec Pipeyard**.
+* **GitLab Runner self-hosted**.
+* **Unleash** : Feature flagging
+
+== 📊 Observabilité & Résilience
+
+* **OpenTelemetry**
+** Traces, métriques, logs.
+** Pipelines fins, stockage en S3 (MinIO/AWS/GCP) → rétention 2 mois.
+** Traces problématiques envoyées vers ClickHouse.
+** Front et back couverts en entier, de sorte que l'on puisse suivre le flux du front vers le back
+** collector agent daemonset + collector routeur
+
+* **Distributed profiling** : Pyroscope pour CPU/mémoire.
+* **Alertmanager** : alertes via mail + webhook (taux d’erreurs, seuils critiques).
+* **Grafana**
+** Tableaux de bord temps réel pour la supervision technique et business.
+
+* **Mimir / Tempo / Loki**
+** Mimir : Stockage distribué des métriques
+** Tempo : Stockage distribué des traces
+** Loki : Stockage distribué des logs
+
+__En phase avancée__
+
+* **Chaos engineering & replay d’incidents**
+** Validation proactive de la résilience via injection de pannes (LitmusChaos, Gremlin).
+** Rejouer des incidents réels pour vérifier l’efficacité des
+
+== 🌐 Publications & Certificats
+
+* **Interne** : cert-manager + Vault issuer + PKI interne.
+* **Externe** : cert-manager + Let’s Encrypt.
+
+== 👩‍💻 DevX & Gouvernance
+
+* **Backstage** : portail interne et catalogue d’applications.
+* **Notifications post-pipeline** : URL de review automatique + lien vers pipeline
+* **CI/CD feedback** :
+** Analyse qualité code (linters, SonarQube, etc.).
+** Détection vulnérabilités : Snyk, Trivy, Dependabot.
+* **Release note automatique** avec gitlab tracker
+* **Supply chain security**
+** Signature d’images (Cosign/Sigstore).
+** Génération et vérification de SBOM (Software Bill of Materials).
+* SLOs management avec Pyrra
+* CPU/Memory profiling avec Pyroscope
+
+* **Filebrowser**
+** Accès et exploration des fichiers via interface web.
+** Utile pour debugging, vérification rapide de volumes montés ou artefacts de build.
+
+== 🗄️ Données & Machine Learning
+
+* **Stockage objet** : MinIO S3 / AWS S3 / GCP Storage.
+* **Data Lakehouse** : Apache Iceberg + Project Nessie (catalog).
+* **Prévision ML (FinOps)** : TFT (Temporal Fusion Transformer) pour anticiper la charge et piloter l’autoscaling.
+* **Autoscaling FinOps avec Karpenter**
+** Intégration des prévisions ML (TFT) avec Karpenter pour provisionner dynamiquement les nœuds optimaux (on-demand, spot).
+** Optimisation continue des coûts et de la performance.
+
+== 🎯 Cibles de mise en place
+
+* **Kit socle (MVP start-up)**
+** Vault, Keycloak, Terraform CI, GitLab, Cloudnative PG, OTel basique.
+
+* **Kit croissance (scale-up)**
+** Istio avancé, profiling, Backstage, rétroactions CI, Harbor.
+
+* **Kit cible (hypergrowth)**
+** Shadowing back, Canary front, Data Lake (Iceberg/Nessie), FinOps ML (TFT + autoscaling).
