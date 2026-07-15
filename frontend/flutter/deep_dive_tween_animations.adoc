@@ -1,0 +1,245 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+
+= Deep dive tweens, animations and animation controller
+
+== Les tickers
+
+Les tickers sont l'élement le plus fondamental des animations. Il sont ce qui reconstruit le visuel à chaque frame.
+
+Un ticker sert principalement à planifier des transientCallbacks qui visent comme le nom de la méthode à laquelle ils appartiennet à préparer la prochaine frame (BeginFrame). On passe notre callback qui contient dans la plupart des cas un setState. Ce setState aura pour effet d'ajouter tous les elements concernés par l'animation à la liste des elements dirty.
+
+La callback est passée en paramètre
+
+.class Ticker
+[source, dart]
+----
+  Ticker(this._onTick, { this.debugLabel }) {
+    assert(() {
+      _debugCreationStack = StackTrace.current;
+      return true;
+    }());
+    // TODO(polina-c): stop duplicating code across disposables
+    // https://github.com/flutter/flutter/issues/137435
+    if (kFlutterMemoryAllocationsEnabled) {
+      FlutterMemoryAllocations.instance.dispatchObjectCreated(
+        library: 'package:flutter/scheduler.dart',
+        className: '$Ticker',
+        object: this,
+      );
+    }
+  }
+----
+
+Le début du travail du ticker est la méthode start qui doit être appelée:
+
+.start
+[source, dart]
+----
+  TickerFuture start() {
+    assert(() {
+      if (isActive) {
+        throw FlutterError.fromParts(<DiagnosticsNode>[
+          ErrorSummary('A ticker was started twice.'),
+          ErrorDescription('A ticker that is already active cannot be started again without first stopping it.'),
+          describeForError('The affected ticker was'),
+        ]);
+      }
+      return true;
+    }());
+    assert(_startTime == null);
+    _future = TickerFuture._();
+    if (shouldScheduleTick) {
+      scheduleTick();
+    }
+    if (SchedulerBinding.instance.schedulerPhase.index > SchedulerPhase.idle.index &&
+        SchedulerBinding.instance.schedulerPhase.index < SchedulerPhase.postFrameCallbacks.index) {
+      _startTime = SchedulerBinding.instance.currentFrameTimeStamp;
+    }
+    return _future!;
+  }
+----
+
+Elle retourne une future qui permets de suivre l'appel dans la frame en cours. Elle planifie l'appel dans un premier temps par scheduleTick()
+
+.scheduleTick
+[source, dart]
+----
+  @protected
+  void scheduleTick({ bool rescheduling = false }) {
+    assert(!scheduled);
+    assert(shouldScheduleTick);
+    _animationId = SchedulerBinding.instance.scheduleFrameCallback(_tick, rescheduling: rescheduling);
+  }
+----
+
+
+Le point important est qu'elle ne schedule pas _onTick directement qui est  la callback mais _tick, méthode privée:
+
+._tick
+[source, dart]
+----
+  void _tick(Duration timeStamp) {
+    assert(isTicking);
+    assert(scheduled);
+    _animationId = null;
+
+    _startTime ??= timeStamp;
+    _onTick(timeStamp - _startTime!);
+
+    // The onTick callback may have scheduled another tick already, for
+    // example by calling stop then start again.
+    if (shouldScheduleTick) {
+      scheduleTick(rescheduling: true);
+    }
+  }
+----
+
+Cette méthode déclenche la callback:
+
+._onTick
+[source, dart]
+----
+_onTick(timeStamp - _startTime!);
+----
+
+Mais replanifie également la callback pour la prochaine frame:
+
+.appel en boucle via _tick
+[source, dart]
+----
+if (shouldScheduleTick) {
+  scheduleTick(rescheduling: true);
+}
+----
+
+== SingleTickerProviderMixin
+
+La mixin SingleTickerProvider est une couche d'abstraction qui offre la méthode pour créer le ticker
+
+.createTicker
+[source, dart]
+----
+  Ticker createTicker(TickerCallback onTick) {
+    if (_tickerModeNotifier == null) {
+      // Setup TickerMode notifier before we vend the first ticker.
+      _updateTickerModeNotifier();
+    }
+    assert(_tickerModeNotifier != null);
+    _tickers ??= <_WidgetTicker>{};
+    final _WidgetTicker result = _WidgetTicker(onTick, this, debugLabel: kDebugMode ? 'created by ${describeIdentity(this)}' : null)
+      ..muted = !_tickerModeNotifier!.value;
+    _tickers!.add(result);
+    return result;
+  }
+----
+
+Elle s'assure également que le ticker est dispose.
+
+Autrement dit elle est ici pour s'assurer du cycle de vie du ticker, et pour étendre les fonctionnalités d'un widget en lui apportant la méthode createTicker.
+
+== AnimationController
+
+L'object principal de l'animation est de faire le pont entre le ticker (qui reconstruit à chaque frame), et le la value utilisée pour l'animation. C'est lui qui fait varier la value en fonction du ticker. En définitif, il fournit une animation.value aux AnimatedWidgets, et c'est lui qui passe la callback qui notifie également les AnimatedWidgets.
+
+Il est tout d'abord responsable de créer le ticker, et donc de le mettre en pause, de l'activer etc.
+C'est pour cette raison qu'on lui passe un vsync qui est la classe qui implémente un vsync, le vsync est une référence vers l'objet qui contient la méthode createTicker.
+
+A son instanciation il commence par faire deux chose, définir la direction et créer le ticker. Elle définit également des lowerBound et uppperBound qui permettent de savoir ou l'animation commence et ou elle finit. Par défaut, ils sont settés à -1 et 1.
+
+.constructor et createTicker
+[source, dart]
+----
+  AnimationController({
+    double? value,
+    this.duration,
+    this.reverseDuration,
+    this.debugLabel,
+    this.lowerBound = 0.0,
+    this.upperBound = 1.0,
+    this.animationBehavior = AnimationBehavior.normal,
+    required TickerProvider vsync,
+  }) : assert(upperBound >= lowerBound),
+       _direction = _AnimationDirection.forward {
+    if (kFlutterMemoryAllocationsEnabled) {
+      _maybeDispatchObjectCreation();
+    }
+    _ticker = vsync.createTicker(_tick);
+    _internalSetValue(value ?? lowerBound);
+  }
+----
+
+Le createTicker créé le ticker en lui passant la callback _tick. _tick est centrale, à chaque tick envoyé par le ticket au scheduler (pendant la beginFrame) elle mettra à jour la valeur de l'animation.value, et elle notifiera les listeners.
+
+._tick
+[source, dart]
+----
+  void _tick(Duration elapsed) {
+    _lastElapsedDuration = elapsed;
+    final double elapsedInSeconds = elapsed.inMicroseconds.toDouble() / Duration.microsecondsPerSecond;
+    assert(elapsedInSeconds >= 0.0);
+    _value = clampDouble(_simulation!.x(elapsedInSeconds), lowerBound, upperBound);
+    if (_simulation!.isDone(elapsedInSeconds)) {
+      _status = (_direction == _AnimationDirection.forward) ?
+        AnimationStatus.completed :
+        AnimationStatus.dismissed;
+      stop(canceled: false);
+    }
+    notifyListeners();
+    _checkStatusChanged();
+  }
+----
+
+
+.mise à jour l'animation.value et notifyListeners
+[source, dart]
+----
+    _value = clampDouble(_simulation!.x(elapsedInSeconds), lowerBound, upperBound);
+    notifyListeners();
+----
+
+Si l'on étudie maintenant le widget AnimatedWidget on constate qu'elle s'incrit en tant que listener et que lorsqu'elle reçoit une notification, elle ne fait que s'ajouter aux élements dirty via un setState. La classe AnimatedWidget ne fournit donc qu'un moyen de s'assurer que l'animation.value est à jour à chaque frame.
+
+.addListener et setState
+[source, dart]
+----
+abstract class AnimatedWidget extends StatefulWidget {
+  /// Creates a widget that rebuilds when the given listenable changes.
+  ///
+  /// The [listenable] argument is required.
+  const AnimatedWidget({
+    super.key,
+    required this.listenable,
+  });
+
+  /// The [Listenable] to which this widget is listening.
+  ///
+  /// Commonly an [Animation] or a [ChangeNotifier].
+  final Listenable listenable;
+
+  // ...
+}
+
+class _AnimatedState extends State<AnimatedWidget> {
+  @override
+  void initState() {
+    super.initState();
+    widget.listenable.addListener(_handleChange);
+  }
+
+  //...
+
+  void _handleChange() {
+    setState(() {
+      // The listenable's state is our build state, and it changed already.
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.build(context);
+}
+----
