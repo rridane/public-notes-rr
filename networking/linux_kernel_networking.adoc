@@ -1,0 +1,1059 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+
+= Deep dive in Linux kernel networking (L2/L3 path)
+
+Cette fiche a pour vocation de faire un deep dive dans la logique de routage L2/L3 du kernel linux.
+
+== Définitions
+
+=== Trame
+
+Sur un lien Ethernet, ce qui circule est une **trame de couche 2** (L2), pas un “paquet IP” déjà prêt.
+
+.Structure (cas classique Ethernet + IPv4) :
+[source,bash]
+----
+[ MAC dst ][ MAC src ][ EtherType ][ Payload (ex: IPv4) ][ CRC ]
+----
+
+=== DMA
+
+DMA = Direct Memory Access.
+C’est une fonctionnalité matérielle qui permet à une carte (par ex. une carte réseau) de lire/écrire directement dans la mémoire RAM, sans passer par le CPU pour chaque octet.
+
+* Sans DMA (ancien monde)
+** La NIC reçoit un paquet depuis le câble.
+** Elle déclenche une interruption à chaque octet/paquet.
+** Le CPU doit copier les données depuis le registre de la carte vers la RAM.
+** 👉 Très coûteux : beaucoup d’interruptions, beaucoup de cycles CPU gaspillés.
+
+* Avec DMA (moderne, toutes les NIC aujourd’hui)
+
+** Le driver réserve une zone mémoire dans la RAM (un buffer) et en donne l’adresse à la carte (via des descripteurs DMA).
+** La NIC écrit directement la trame reçue dans ce buffer RAM (RX ring buffer).
+** Une fois le buffer rempli, elle signale au CPU via une interruption : « J’ai mis un paquet ici ».
+** Le CPU n’a plus qu’à traiter un pointeur → énorme gain de performance.
+
+=== Switch, L2 et routeur
+
+Un switch lit la couche L2 pour alimenter sa FDB (forwarding table), Quand une trame arrive, le switch lit la mac source, et créé un mapping entre l'adresse mac et l'interface sur laquelle il a reçu la trame.
+Si sa table ne connait pas l'addresse mac il envoie la trame sur tous les ports.
+
+A noter qu'un paquet contient l'adresse mac de destination parce qu'en amont, le dernier routeur a soit fait un arp flood (Who as IP ...), et le prochain routeur / machine a répondu avec son adresse mac, soit il la connaissait déjà.
+
+Donc lorsqu'un nouveau paquet arrive, il lit l'adresse mac de destination, consulte sa FDB pour forwarder le traffic.
+
+== Files d’entrée/sortie (queues) : RX rings, NAPI, qdisc, et rythme de traitement
+
+Avant de parler routage, il faut comprendre **où vont les paquets** et **qui décide quand ils sont traités ou transmis**.
+
+Sur Linux, **on ne “pousse” pas** un paquet directement sur une interface ; on **l’enfile** dans une **file d’attente** (queue), et des mécanismes noyau (NAPI, softirq, qdisc) orchestrent le traitement.
+
+[NOTE]
+--
+Toutes les queues dont nous parlerons sont par interface.
+Chaque interface dispose de tout ce que nous allons décrire dans les sections suivantes.
+--
+
+=== Vue d'ensemble
+
+Quand une trame ethernet arrive sur une interface (`eth0`, `cni0`, etc):
+
+. Réception matérielle (NIC + DMA)
+* La NIC (carte réseau, physique ou virtuelle comme `veth`) reçoit la trame.
+* Elle l'écrit directement en mémoire dans la RX Ring de l'interface.
+La RX ring est une file d'attente.
+Elle écrit sans passer par le CPU grâce au DMA.
+. Signal d'interuption (IRQ)
+* La NIC déclenche (électriquement ou via un message PCIe) un IRQ.
+* Le CPU reçoit l'alerte et interrompt ce qu'il faisait
+** Le CPU dispose d'un mapping (via une table IDT ou Interrupt Descriptor Table) qui mappe le code du signal avec la fonction kernel à executer.
+C'est le kernel lui même qui l'a chargée au boot.
+(On appelles ces fonctions des ISR, ou Interrupt Service Routine)
+** Le CPU appelle la méthode associée au code IRQ.
+. Le driver réseau du kernel prends la main.
+Il désactive les IRQ RX (Réception pour l'interface en question) afin de ne pas être spammé pour les nouvelles trames.
+Il réactivera les IRQ RX si la queue devient vide.
+* Le driver réseau du kernel programme une tâche cpu de polling (par batch), cette tâche est appelée softIRQ (`NET_RX` pour réception)
+. La tâche softIRQ démarre le traitement par batch.
+Pour chaque trame, le kernel :
+- alloue un skb (struct qui représente réellement le paquet et son contexte dans le kernel)
+- renseigne le contexte
+-> skb->dev = interface de l'entrée
+-> skb->data = pointeur sur le début de la trame Ethernet
+-> skb->len = taille
+-> skb-> protocol = (souvent ethertype, ipv6, ipv4 ou ARP)
+. Optimisation (GRO - Generic Receive Offload)
+* Si plusieurs paquets consécutifs appartiennent au même flux TCP, Linux peut les fusionner en un seul skb plus gros.
+👉 Résultat : moins d’appels dans la pile réseau, donc moins de surcharge CPU.
+👉 C'est aussi ce qui explique que des logiciels de packet inspection voit des paquets plus gros que le MTU (Ou se place exactement wireshark ??)
+. Entrée dans la pile réseau
+* Chaque skb est remis à la pile avec netif_receive_skb(skb). netif_receive_skb est une fonction synchrone (de nos jours) appelée par le driver réseau.
+C'est cette fonction qui permet le traitement par la couche L2/L3 que nous verrons ensuite.
+
+C'est à partir de là que nous ferons un zoom.
+Mais il est essentiel de retenir deux choses :
+* Les interfaces gèrent les paquets par un système de **queue par interface**.
+Les entrées sont des trames.
+* c'est une struc appelée **skb** qui contient le contexte de la trame (interface etc).
+
+[plantuml,linux-rx-path,png]
+----
+@startuml
+skinparam dpi 150
+skinparam rectangle {
+  BackgroundColor #f5f5f5
+  BorderColor #888
+  RoundCorner 10
+}
+skinparam note {
+  BackgroundColor #ffffcc
+  BorderColor #555
+}
+skinparam arrowColor #555
+
+title Chemin d'entrée (RX) : NIC → RX ring → IRQ → Driver → softIRQ → skb → Pile réseau
+
+rectangle "Interface réseau (eth0 / veth...)\n[NIC]" as NIC
+rectangle "RX ring (RAM)\nDMA buffers (file d'attente)" as RX
+rectangle "IRQ → CPU" as IRQ
+rectangle "IDT → ISR du driver\n(routine d'interruption)" as ISR
+rectangle "softIRQ NET_RX\n(NAPI polling par batch)" as SIRQ
+rectangle "Construction des skb\n(skb->dev, data, len, protocol...)" as SKB
+rectangle "netif_receive_skb(skb)\n→ Dispatch L2/L3" as NETIF
+rectangle "Pile L2/L3\n(Ethertype → IPv4/IPv6/ARP...)" as L3
+
+NIC -down-> RX : écrit la trame sur la RAM (DMA)
+RX -down-> IRQ : "paquets disponibles"
+IRQ -down-> ISR : lookup IDT → routine driver
+ISR -down-> SIRQ : désactive IRQ RX + planifie NAPI
+SIRQ -down-> SKB : lit N paquets (batch)
+SKB -down-> NETIF
+NETIF -down-> L3
+
+note right of RX
+RX ring = file circulaire en RAM
+alimentée en DMA par la NIC.
+Chaque interface a sa/son RX ring(s).
+end note
+
+note right of SIRQ
+NAPI : lit plusieurs trames
+par lot (ex: 64) pour éviter
+une IRQ par paquet.
+end note
+
+note right of SKB
+Le skb encapsule la trame et
+son contexte (interface d'entrée,
+taille, protocole...).
+end note
+
+note right of L3
+Ethertype :
+- 0x0800 → IPv4 (ip_rcv)
+- 0x86DD → IPv6 (ipv6_rcv)
+- 0x0806 → ARP (arp_rcv)
+end note
+
+@enduml
+----
+
+== De la trame (L2) à la pile IP (L3) & Vue macro
+
+=== Décapsulation L2 → L3 : lecture de l’EtherType
+
+La pile réseau commence par **parser l’entête Ethernet** pour savoir quoi faire du *payload* :
+
+- Si `EtherType == IPv4` → handler IPv4 (**`ip_rcv()`**).
+- Si `EtherType == IPv6` → handler IPv6 (**`ipv6_rcv()`**).
+- Si `EtherType == ARP` → handler ARP (**`arp_rcv()`**).
+- Sinon → drop ou autres chemins spécialisés.
+
+👉 C’est seulement **après** cette étape qu’on parle de **paquet IP** (L3).
+C'est à partir de cette étape que le paquet IP existe.
+
+=== Cas bridge (ex: cni0) : switching L2 ou livraison à L3
+
+Si l’interface d’entrée est **esclave d’un bridge Linux** (ex. la veth d’un Pod branchée sur `cni0` par ex) :
+
+- Le noyau passe par exactement par la **logique bridge (L2)** que nous avons vu dans la section définition : apprentissage MAC, FDB, décision de commutation.
+- Si la **MAC de destination** est *connue et non locale* → **commutation L2** vers le bon port (pas de L3 du tout).
+En réalité, il modifie l'interface en spécifiant l'interface de sortie, et place le skb dans la `TX queu (qdisc egress)` de l'interface de sortie.
+Nous verrons plus tard comment un scheduler récupère le skb pour envoyer la trame par la suite.
+- Si la **MAC de destination est locale** (ou broadcast) → **livraison à la pile IP** (L3).
+Cela signifie qu'il comprends que c'est lui même (le kernel) qui va devoir traiter le skb.
+Il modifie l'interface d'origine (`skb->dev`) puis appelle netif_receive_skb.
+On repart donc au début du processus que nous avons commencé ici.
+
+=== Décision locale vs routage (L3)
+
+Une fois en **IPv4/IPv6** :
+
+- Si **destination = locale** → chemin **INPUT** (Netfilter INPUT) → **socket** (TCP/UDP/ICMP).
+- Sinon → **routage** :
+- `rp_filter` éventuel (anti-spoof),
+- **policy routing** (`ip rule`) pour choisir la table FIB,
+- Netfilter **FORWARD**,
+- décrément du TTL, checksum, etc.
+
+Si une **route** est trouvée : on détermine l’**interface de sortie** (`oif`) et le **next-hop**.
+Si la **MAC** du next-hop/destination n’est pas connue → **ARP/ND** (mise en attente dans la *neigh queue*).
+
+=== Encapsulation et sortie : ARP → trame L2 → qdisc (tc) → driver
+
+Avant l’envoi effectif :
+- **Encapsulation L2** : on **construit la trame Ethernet** de sortie (dst MAC, src MAC, EtherType, payload IP).
+- **`dev_queue_xmit(skb)`** : on **enfile** la trame dans la **qdisc** (file d’attente) de l’interface de sortie.
+- La **qdisc** (configurée via `tc`) décide **quand** et **dans quel ordre** les paquets partent (shaping, scheduling…).
+- Netfilter **POSTROUTING** peut s’appliquer (SNAT/MASQUERADE).
+- Enfin, le **driver TX** envoie (DMA → NIC → fil / ou veth peer).
+
+👉 On **n’appelle pas** directement “send sur l’interface”.
+On **place** le paquet dans la **queue (qdisc)** de l’interface ; le **scheduler** + le **driver** s’occupent de l’émission réelle.
+
+=== 7) Où s’insèrent Netfilter et TC (vue rapide)
+
+- **PREROUTING** (raw → mangle → nat) : juste après L2, avant décision locale/forward.
+- **INPUT** (mangle → filter) : vers la pile locale.
+- **FORWARD** (mangle → filter) : pour les paquets routés.
+- **POSTROUTING** (mangle → nat) : juste avant l’envoi physique.
+- **TC/qdisc (egress)** : entre la décision d’envoi (`dev_queue_xmit`) et le driver (ordonnancement, shaping).
+
+== Pseudo-code enrichi
+
+On greffe ces exceptions dans le pseudo-code pour bien montrer où elles s’appliquent :
+
+[source,c]
+----
+// Appelé lorsqu'une trame Ethernet arrive sur une interface réseau
+function handle_frame(frame, ingress_if):
+
+  if not mac_belongs_to_interface(frame.dst_mac, ingress_if) and not is_broadcast(frame.dst_mac):
+      bridge_forward_or_drop(frame, ingress_if)
+      return
+
+  ip_packet = parse_ipv4(frame.payload)
+
+  if not checksum_ok(ip_packet):
+      drop(frame)
+      return
+
+  if ip_packet.dst in local_ip_addresses():
+      deliver_to_local_socket(ip_packet)
+      return
+
+  if sysctl["net.ipv4.ip_forward"] != 1:
+      drop(frame)  // routage interdit
+      return
+
+  // Lookup avec policy routing (peut dépendre de ingress_if, skb->mark, etc.)
+  route = fib_lookup_with_rules(ip_packet.dst, ingress_if, skb->mark)
+  if route == null:
+      icmp_destination_unreachable(ip_packet.src)
+      return
+
+  // Vérifier rp_filter si activé
+  if sysctl["net.ipv4.conf[ingress_if].rp_filter"] == 1:
+      if !reverse_path_valid(ip_packet.src, ingress_if):
+          drop(frame) // asymétrie suspecte
+          return
+
+  // Hooks Netfilter FORWARD (peuvent matcher -i / -o)
+  if nftables_drop_or_accept(ip_packet, ingress_if) == DROP:
+      return
+
+  ip_packet.ttl -= 1
+  if ip_packet.ttl == 0:
+      icmp_time_exceeded(ip_packet.src)
+      return
+  recalc_checksum(ip_packet)
+
+  next_hop = route.next_hop
+  out_if   = route.dev
+  dst_mac  = arp_resolve(next_hop, out_if)
+
+  // Hooks Traffic Control (TC) sur l’interface de sortie
+  if tc_filter_drop_or_shape(ip_packet, out_if) == DROP:
+      return
+
+  new_frame = ethernet_frame(
+      src_mac = out_if.mac,
+      dst_mac = dst_mac,
+      ethertype = ETH_IPV4,
+      payload = ip_packet
+  )
+
+  transmit(new_frame, out_if)
+----
+
+Les premiers points sont parlants.
+Nous noterons les points suivants:
+
+Le kernel linux ne se soucie par de l'interface qui reçoit les paquets lorsque le paquet est sur le même namespace.
+Une autre manière de dire cela est que les méthodes qui vont gérer le routing ne dépendent pas de l'interface d'arrivée.
+Donc les paquets qui arrivent par l'interface cni0 (kubernetes) ou par l'interface ens160 (interface machine) sont traités de la même manière.
+
+Le pipeline de routage regarde uniquement l'IP de destination et la table de routage.
+L'interface est utilisée uniquement pour vérifier que l'adresse mac de destination est bien celle sur laquelle le paquet est arrivé.
+
+L'interface est connue grâce à un contexte (**struct sk_buff**), c'est l'objet central du networking linux.
+Il contient notamment :
+
+* `skb->dev` → l’interface d’entrée (device struct, `struct net_device *`)
+* `skb->ingress_ifindex` → index numérique de l’interface d’entrée
+* `skb->mark` → marque optionnelle (utilisée en policy routing, iptables MARK)
+* `skb->priority`, `skb->protocol`, etc.
+
+Donc le kernel sait toujours par où le paquet est arrivé.
+Mais le pipeline “normal” (routing L3 classique) n’en tient pas compte, sauf si on actives des mécanismes spéciaux.
+
+La suite présente d'abord un pseuco code du kernel linux puis la liste des exceptions:
+
+=== Quand ça sert ?
+
+En temps normal, le pipeline de routage est *agnostique de l’interface d’entrée*.
+Mais dans certains cas, l’interface (`skb->dev`) influe sur le traitement.
+
+Voici les 4 exceptions principales
+
+== rp_filter (Reverse Path Filtering)
+
+=== Définition
+
+`rp_filter` est une option du noyau Linux (sysctl) qui permet de lutter contre l’*IP spoofing*.
+L’idée est simple :
+
+> Si je reçois un paquet avec une adresse source `S` sur une interface `I`, alors pour que ce paquet soit accepté, il faut que la route de retour vers `S` passe bien par `I`.
+
+Si ce n’est pas le cas, le paquet est considéré comme incohérent (potentiellement usurpé) et il est rejeté.
+
+=== Activation
+
+On configure `rp_filter` via sysctl :
+
+[source,bash]
+----
+# Activer en mode strict sur toutes les interfaces
+sysctl -w net.ipv4.conf.all.rp_filter=1
+
+# Activer en mode loose
+sysctl -w net.ipv4.conf.all.rp_filter=2
+
+# Désactiver
+sysctl -w net.ipv4.conf.all.rp_filter=0
+----
+
+- `0` → désactivé
+- `1` → strict (la route de retour doit utiliser la même interface)
+- `2` → loose (il suffit qu’une route existe, peu importe laquelle)
+
+=== Algorithme (simplifié)
+
+[source,c]
+----
+function reverse_path_valid(src_ip, ingress_if):
+    route = fib_lookup(src_ip) // chercher la route vers la source
+
+    if route == null:
+        return false
+
+    if rp_filter_mode == STRICT:
+        return (route.dev == ingress_if) // doit matcher
+    else if rp_filter_mode == LOOSE:
+        return true  // tant qu'une route existe
+    else:
+        return true  // mode désactivé
+----
+
+=== Exemple concret
+
+Table de routage d’un routeur :
+
+[source,bash]
+----
+192.168.1.0/24 dev eth0
+10.0.0.0/24    dev eth1
+default via ...
+----
+
+Cas normal :
+- Paquet reçu de `192.168.1.10` via `eth0`.
+- `fib_lookup(192.168.1.10)` → sortie attendue = `eth0`.
+- Comme `ingress_if = eth0`, cohérent → paquet accepté.
+
+Cas spoofé :
+- Paquet reçu avec **source = 192.168.1.10** mais arrivant via `eth1`.
+- `fib_lookup(192.168.1.10)` → sortie attendue = `eth0`.
+- `ingress_if != route.dev` → incohérent.
+- → En mode strict : DROP.
+- → En mode loose : accepté (car une route existe).
+
+=== Cas d’usage
+
+* **Protection anti-spoofing**
+Empêche qu’un attaquant envoie depuis Internet (eth0) des paquets avec une source interne (192.168.1.x).
+Sans rp_filter, ces paquets pourraient être traités comme légitimes.
+
+* **Sécurité en edge-router/firewall**
+Recommandé pour les routeurs en bordure de réseau afin de bloquer le trafic incohérent.
+
+* **Kubernetes et environnements overlay**
+Souvent désactivé (`rp_filter=0`) car les chemins peuvent être asymétriques (entrée par une interface, sortie par une autre).
+Sinon, risque de faux positifs.
+
+=== Scénario d’attaque (spoofing)
+
+1. Attaquant sur Internet envoie un paquet avec source falsifiée `192.168.1.10` (LAN interne).
+2. Le paquet arrive sur `eth0` (WAN).
+3. Sans rp_filter :
+- Le système croit que la source est interne.
+- Le firewall autorise (ex : règle "ACCEPT si src 192.168.1.0/24").
+- L’attaquant entre dans le réseau.
+
+4. Avec rp_filter strict :
+- Lookup route(192.168.1.10) → `eth0` attendu ?
+Non, c’est `eth1`.
+- Incohérence détectée.
+- Paquet DROP.
+
+== Policy Routing (routage basé sur règles)
+
+=== Définition
+
+Par défaut, Linux utilise une **seule table de routage** (la FIB principale) pour décider du chemin de sortie en fonction de l’IP de destination.
+
+Avec le **policy routing**, Linux permet de définir plusieurs tables de routage et de choisir laquelle appliquer selon des critères définis dans des règles (`ip rule`).
+
+👉 Cela ajoute une couche de **sélection de la table de routage** avant le lookup.
+
+=== Commandes de base
+
+- Les tables sont définies dans `/etc/iproute2/rt_tables`.
+- Commandes principales :
+
+[source,bash]
+----
+# Ajouter une règle : si un paquet entre par l’interface cni0,
+# alors on utilisera la table de routage 100 (au lieu de la table main).
+ip rule add iif cni0 lookup 100
+
+# Ajouter une règle : si l’adresse source du paquet appartient au sous-réseau 192.168.1.0/24,
+# alors on utilisera la table de routage 200.
+ip rule add from 192.168.1.0/24 lookup 200
+
+# Ajouter une règle : si le paquet porte la marque 0x1 (ajoutée par iptables/nftables, par ex.),
+# alors on utilisera la table de routage 300.
+ip rule add fwmark 0x1 lookup 300
+
+# Afficher toutes les règles de policy routing, triées par priorité.
+# Chaque règle indique le critère de sélection et la table associée.
+ip rule show
+
+# Ajouter une route dans la table 100 :
+# pour atteindre le sous-réseau 10.0.0.0/24, passer directement par l’interface eth1.
+ip route add 10.0.0.0/24 dev eth1 table 100
+
+# Ajouter une route par défaut dans la table 200 :
+# pour tout trafic sans correspondance plus spécifique,
+# envoyer vers la passerelle 192.168.1.1 via l’interface eth0.
+ip route add default via 192.168.1.1 dev eth0 table 200
+----
+
+Chaque règle peut matcher sur :
+- Interface d’entrée (`iif`) - Adresse source (`from`) - Adresse destination (`to`) - Marque de paquet (`fwmark`) - Priorité
+
+=== Algorithme (simplifié)
+
+[source,c]
+----
+function fib_lookup_with_rules(dst_ip, ingress_if, src_ip, fwmark):
+    for rule in rule_list_sorted_by_priority:
+        if rule.matches(ingress_if, src_ip, dst_ip, fwmark):
+            route = fib_lookup_in_table(rule.table, dst_ip)
+            if route != null:
+                return route
+    // fallback : table main
+    return fib_lookup_in_table(MAIN, dst_ip)
+----
+
+- Le noyau parcourt la liste des règles (`ip rule show`).
+- À la première correspondance, il consulte la table associée.
+- Si une route est trouvée → utilisée.
+- Sinon, il continue avec les règles suivantes.
+- S’il n’y a rien → table principale (main).
+
+=== Exemple concret
+
+==== Contexte
+
+Un serveur avec deux interfaces :
+- `eth0` → WAN (192.0.2.10) - `eth1` → LAN (10.0.0.1)
+
+==== Problème
+
+On veut que :
+- Tout trafic entrant par `eth0` ressorte par `eth0`.
+- Tout trafic entrant par `eth1` ressorte par `eth1`.
+
+==== Solution (policy routing)
+
+[source,bash]
+----
+# Table 100 : routage pour eth0
+ip route add default via 192.0.2.1 dev eth0 table 100
+
+# Table 200 : routage pour eth1
+ip route add default via 10.0.0.254 dev eth1 table 200
+
+# Règles de sélection
+ip rule add iif eth0 lookup 100
+ip rule add iif eth1 lookup 200
+----
+
+Résultat : le trafic respecte la symétrie d’interface.
+
+=== Cas d’usage
+
+* **Multi-homing**
+- Serveur avec plusieurs opérateurs Internet.
+- On veut que les paquets sortent par le même FAI que celui par lequel ils sont entrés.
+
+* **VPNs multiples**
+- Selon l’adresse source ou la marque de paquet, on choisit la bonne table (par ex. pour forcer certains flux dans le VPN).
+
+* **Kubernetes / containers**
+- Permet de router différemment le trafic des pods (`iif=cni0`) vs celui du host (`iif=ens160`).
+
+* **QoS / Firewall avancé**
+- Utilisé en combinaison avec Netfilter : iptables peut appliquer un `MARK`, puis une règle `ip rule fwmark` choisit la table de routage correspondante.
+
+=== Différences avec le routage classique
+
+- Routage classique : une seule FIB, basée uniquement sur `dst_ip`.
+- Policy routing : plusieurs FIBs, choisies selon des règles.
+- C’est une **seconde dimension** de décision de routage (basée sur contexte).
+
+=== Exemple d’attaque ou de bug
+
+Sans policy routing :
+- Un paquet arrive sur `eth1` mais ressort par `eth0` (car route par défaut est sur `eth0`).
+- → Asymétrie → problème avec `rp_filter` ou avec le firewall du voisin.
+
+Avec policy routing :
+- On impose que les paquets entrés sur `eth1` ressortent sur `eth1`.
+- → Résout l’asymétrie.
+
+== Exemple complet : multi-homing avec policy routing
+
+=== Le fichier /etc/iproute2/rt_tables
+
+Le noyau Linux supporte plusieurs **tables de routage**.
+Chaque table est identifiée par un **numéro** et un **nom**.
+
+La correspondance entre nom et numéro est définie dans `/etc/iproute2/rt_tables` :
+
+[source,bash]
+----
+# Fichier /etc/iproute2/rt_tables
+
+255     local      # routes locales (automatiques, gérées par le kernel)
+254     main       # table principale par défaut
+253     default    # table fallback si aucune autre ne match
+0       unspec
+
+# Lignes personnalisées
+100     wan1
+200     wan2
+----
+
+- `main` (254) est la table utilisée par défaut si aucune règle `ip rule` ne dit autrement.
+- On peut définir nos propres tables avec un numéro (1–252, sauf réservés).
+- Ici, on crée deux tables : `wan1` et `wan2`.
+
+=== Contexte du scénario
+
+Une machine possède deux accès WAN :
+- `eth0` → WAN1 (IP publique 192.0.2.10, gateway 192.0.2.1) - `eth1` → WAN2 (IP publique 198.51.100.10, gateway 198.51.100.1)
+
+Objectif :
+- Tout trafic sortant avec **source 192.0.2.10** doit passer par WAN1.
+- Tout trafic sortant avec **source 198.51.100.10** doit passer par WAN2.
+
+=== Configuration
+
+[source,bash]
+----
+# 1. Définir les routes dans chaque table
+
+# Table wan1 : trafic vers Internet via la gateway de WAN1
+ip route add 192.0.2.0/24 dev eth0 table wan1       # réseau local de l'ISP1
+ip route add default via 192.0.2.1 dev eth0 table wan1
+
+# Table wan2 : trafic vers Internet via la gateway de WAN2
+ip route add 198.51.100.0/24 dev eth1 table wan2    # réseau local de l'ISP2
+ip route add default via 198.51.100.1 dev eth1 table wan2
+
+# 2. Ajouter les règles de policy routing
+
+# Si l'adresse source est 192.0.2.10 → utiliser la table wan1
+ip rule add from 192.0.2.10 lookup wan1
+
+# Si l'adresse source est 198.51.100.10 → utiliser la table wan2
+ip rule add from 198.51.100.10 lookup wan2
+
+# 3. Vérifier les règles et les tables
+ip rule show
+ip route show table wan1
+ip route show table wan2
+----
+
+=== Explication du fonctionnement
+
+1. Lorsqu’un paquet est généré par l’hôte, le noyau regarde son **adresse source**.
+2. `ip rule` matche cette source et choisit la table associée (`wan1` ou `wan2`).
+3. Dans la table correspondante, la route par défaut indique la bonne gateway.
+4. Le paquet sort donc toujours par l’interface cohérente avec son adresse source.
+
+=== Utilité
+
+- **Multi-homing** : gérer plusieurs connexions Internet simultanément.
+- **VPN** : forcer certains flux dans une interface chiffrée.
+- **Containers / Kubernetes** : séparer le trafic Pod ↔ Host.
+- **Sécurité** : éviter que des paquets sortent par la “mauvaise” interface et créent des asymétries (rp_filter).
+
+=== Résumé
+
+- `/etc/iproute2/rt_tables` définit les noms et numéros des tables de routage.
+- Policy routing permet de choisir la table selon l’adresse source, l’interface d’entrée, la marque de paquet, etc.
+- Très utile dès qu’on a plusieurs WAN ou plusieurs contextes réseau simultanés.
+
+== iptables
+
+Voir fiche dédiée
+
+== Traffic Control (tc)
+
+=== Définition
+
+`tc` (*Traffic Control*) est l’outil utilisateur pour configurer le sous-système **QoS/traffic shaping** du noyau Linux.
+Il permet de contrôler **comment les paquets sont mis en file et transmis sur une interface**.
+
+Avec `tc`, on peut :
+- **Façonner le trafic (shaping)** : limiter le débit, introduire des délais artificiels.
+- **Contrôler l’ordonnancement (scheduling)** : choisir quels paquets passent en priorité.
+- **Appliquer du filtrage simple** : drop, police de débit.
+- **Mesurer (stats)** : compter, observer les files.
+
+tc ingress :
+
+* Agir avant même L3.
+* Matcher sur L2 (MAC, VLAN, Ethertype).
+* Décider de dropper/rediriger avant d’allouer des ressources (ex: ne pas polluer conntrack, éviter tout parsing IP si c’est inutile).
+* Permet du mirroring (copie du trafic vers une autre interface, ex: IDS/IPS).
+* Permet du policing ultra-rapide (limiter/droper dès l’arrivée, sans toucher L3).
+
+=== Concepts clés
+
+* **qdisc (queueing discipline)**
+- Une “file d’attente” associée à une interface.
+- C’est elle qui décide comment les paquets sont ordonnancés et transmis.
+- Exemples : `pfifo_fast` (par défaut), `fq_codel`, `htb`, `tbf`.
+
+* **classes**
+- Certaines qdisc (classful) permettent de subdiviser le trafic en classes hiérarchiques.
+- Ex. `htb` (Hierarchical Token Bucket).
+
+* **filtres**
+- Permettent d’assigner des paquets à des classes ou d’appliquer directement une action.
+- Matching sur IP, ports, fwmark, protocole, etc.
+
+* **actions (police)**
+- Décision appliquée au paquet : accept, drop, rate-limit.
+
+=== Commandes de base
+
+[source,bash]
+----
+# Voir la qdisc attachée à une interface
+tc qdisc show dev eth0
+
+# Ajouter une qdisc simple (Token Bucket Filter, limite à 1mbit)
+tc qdisc add dev eth0 root tbf rate 1mbit burst 32kbit latency 400ms
+
+# Supprimer la qdisc root (revient au défaut pfifo_fast)
+tc qdisc del dev eth0 root
+
+# Ajouter un filtre : dropper tout trafic vers 10.0.0.0/24
+tc filter add dev eth0 parent 1: protocol ip u32 match ip dst 10.0.0.0/24 drop
+
+# Ajouter une règle de police : limiter à 1mbit puis drop
+tc filter add dev eth0 parent 1: protocol ip u32 \
+    match ip dst 10.244.0.0/16 police rate 1mbit burst 10k drop
+----
+
+=== Exemple concret : limiter un sous-réseau
+
+[source,bash]
+----
+# 1. Ajouter une qdisc HTB sur l’interface
+tc qdisc add dev eth0 root handle 1: htb default 30
+
+# 2. Créer une classe "parente" limitée à 10mbit
+tc class add dev eth0 parent 1: classid 1:1 htb rate 10mbit
+
+# 3. Créer deux classes enfants :
+#    - classe 10 : 2mbit réservés pour le réseau 10.0.0.0/24
+#    - classe 20 : 8mbit réservés pour le reste
+tc class add dev eth0 parent 1:1 classid 1:10 htb rate 2mbit ceil 10mbit
+tc class add dev eth0 parent 1:1 classid 1:20 htb rate 8mbit ceil 10mbit
+
+# 4. Filtrer selon destination IP et assigner aux classes
+tc filter add dev eth0 parent 1: protocol ip u32 match ip dst 10.0.0.0/24 flowid 1:10
+tc filter add dev eth0 parent 1: protocol ip u32 match ip dst 0.0.0.0/0   flowid 1:20
+----
+
+=== Algorithme simplifié
+
+[source,c]
+----
+// Lorsqu'un paquet est prêt à être envoyé sur une interface
+function tc_enqueue(packet, dev):
+    qdisc = dev.qdisc
+    class = qdisc.classify(packet)    // selon filtres, fwmark, etc.
+    enqueue_into_class(packet, class)
+
+function tc_dequeue(dev):
+    qdisc = dev.qdisc
+    packet = qdisc.scheduler()        // choisit le prochain paquet selon les règles (prio, rate, etc.)
+    if packet != null:
+        send_to_nic(packet)
+----
+
+=== Cas d’usage
+
+* **Limiter un client ou un sous-réseau** (éviter qu’un poste sature la bande passante).
+* **Prioriser un type de trafic** (ex : VoIP vs téléchargement).
+* **Tester des conditions réseaux dégradées** (latence, gigue, perte).
+* **Couper du trafic non désiré** au niveau de l’interface (plus bas que iptables).
+
+=== Comparaison avec iptables / nftables
+
+- `iptables/nftables` : filtrage logique (autoriser ou non les paquets).
+- `tc` : contrôle temporel et quantitatif (quand et combien de paquets sortent).
+- Ils se complètent : on peut marquer (`MARK`) un paquet dans Netfilter puis classer avec `tc`.
+
+=== Résumé
+
+- `tc` agit **à la sortie d’une interface** (egress), parfois aussi en ingress avec des qdisc spéciaux (`ifb`).
+- C’est l’outil pour la **QoS, shaping et scheduling** dans Linux.
+- Très puissant mais syntaxe complexe → HTB et fq_codel sont les plus utilisés.
+
+[source,c]
+----
+// ============================================
+// RX -> TX : chaîne complète avec "skb" passé
+// ============================================
+
+// --- Côté driver (IRQ/NAPI) : récupération de la trame L2 ---
+function driver_rx_poll(dev):
+    // La NIC/veth met des trames en mémoire (DMA). On lit la prochaine.
+    buf = dma_read_next_frame(dev)                 // bytes de la TRAME ETHERNET
+    if buf == NULL:
+        return
+
+    // On encapsule le buffer dans un sk_buff (objet central du réseau Linux)
+    skb = alloc_skb(buf)
+    skb->dev      = dev                            // interface d'entrée
+    skb->data     = buf                            // début de la TRAME Ethernet
+    skb->len      = len(buf)
+
+    // Ethertype (IPv4/IPv6/ARP...) est lu par la stack, pas forcément par le driver.
+    // Appel d'entrée de la pile réseau (niveau L2 générique)
+    netif_receive_skb(skb)
+
+
+// --- Entrée pile réseau : distribution L2 -> L3 selon Ethertype ---
+function netif_receive_skb(skb):
+    // Hook: possible chemin "ingress" (TC clsact ingress), sinon passe
+    if tc_ingress_verdict(skb) == DROP:
+        kfree_skb(skb); return
+
+    // Si l'interface est esclave d'un bridge : logique L2 du bridge (FDB)
+    if is_bridge_slave(skb->dev):
+        brv = br_handle_frame(skb)                 // apprentissage MAC, lookup FDB, flood éventuel
+        if brv == BR_FORWARDED_L2:
+            return                                 // commutation L2 terminée (pas de L3)
+        // Sinon : trame pour le bridge lui-même (MAC locale/broadcast) -> on continue
+
+    // Parse en-tête Ethernet pour déterminer l'Ethertype
+    eth = parse_eth_header(skb->data)
+    if eth.type == ETH_P_IP:
+        ip_rcv(skb)                                // passer au handler IPv4 (L3)
+    else if eth.type == ETH_P_IPV6:
+        ipv6_rcv(skb)
+    else if eth.type == ETH_P_ARP:
+        arp_rcv(skb)
+    else:
+        kfree_skb(skb)                             // hors scope ici
+        return
+
+
+// --- IPv4 L3 : PREROUTING -> décision (LOCAL vs FORWARD) ---
+function ip_rcv(skb):
+    ip = parse_ipv4_header(skb)
+    if !checksum_ok(ip):
+        kfree_skb(skb); return
+
+    // Netfilter PREROUTING (raw -> mangle -> nat(DNAT possible))
+    if nf_prerouting_verdict(skb) == DROP:
+        kfree_skb(skb); return
+
+    if is_local_address(ip.dst):
+        // Chemin LOCAL (INPUT)
+        if nf_input_verdict(skb) == DROP:          // mangle -> filter (match -i)
+            kfree_skb(skb); return
+        deliver_to_transport(ip, skb)              // TCP/UDP/ICMP vers socket
+        return
+    else:
+        // Chemin FORWARD (routage)
+        ip_forward(skb, ip)
+
+
+// --- Routage IPv4 : rp_filter -> policy routing -> FORWARD ---
+function ip_forward(skb, ip):
+    if sysctl["net.ipv4.ip_forward"] != 1:
+        icmp_dest_unreachable(ip.src); kfree_skb(skb); return
+
+    // rp_filter (anti-spoof) : compare iif vs route retour
+    mode = sysctl["net.ipv4.conf[skb->dev].rp_filter"]
+    if mode in {STRICT, LOOSE}:
+        if !reverse_path_valid(ip.src, skb->dev, mode):
+            kfree_skb(skb); return
+
+    // Policy routing (ip rule) : choix table selon iif/from/mark...
+    route = fib_lookup_with_rules(
+        dst   = ip.dst,
+        iif   = skb->dev,
+        src   = ip.src,
+        mark  = skb->mark
+    )
+    if route == NULL:
+        icmp_dest_unreachable(ip.src); kfree_skb(skb); return
+
+    // Netfilter FORWARD (mangle -> filter ; match -i/-o)
+    if nf_forward_verdict(skb, oif=route.dev) == DROP:
+        kfree_skb(skb); return
+
+    // Préparation L3 avant envoi
+    ip.ttl -= 1
+    if ip.ttl == 0:
+        icmp_time_exceeded(ip.src); kfree_skb(skb); return
+    recalc_checksum(ip)
+
+    // Résolution voisin (ARP/ND) vers next-hop ou dst selon route
+    nh = route.next_hop_or_dst
+    out_if = route.dev
+    mac = neigh_resolve(nh, out_if)
+    if mac == NULL:
+        // ARP en cours : le skb peut être mis en attente par la neigh queue
+        queue_on_neigh_wait(ip, skb, out_if); return
+
+    // Encapsulation L2 : construire la TRAME Ethernet de sortie
+    out_frame = build_eth_frame(
+        dst_mac = mac,
+        src_mac = out_if.mac,
+        ethertype = ETH_P_IP,
+        payload = ip
+    )
+    skb_out = skb_from_frame(out_frame)
+    skb_out->dev = out_if
+
+    // Traffic Control (TC) egress : qdisc / shaping / drop
+    if tc_egress_verdict(skb_out, out_if) == DROP:
+        kfree_skb(skb_out); return
+
+    // Netfilter POSTROUTING (mangle -> nat(SNAT/MASQUERADE))
+    if nf_postrouting_verdict(skb_out) == DROP:
+        kfree_skb(skb_out); return
+
+    // Émission : driver TX (NIC/veth/virtio...)
+    dev_queue_xmit(skb_out)                         // -> qdisc -> driver -> DMA -> fil/peer
+
+
+// --- Aides conceptuelles (simplifiées) ---
+function reverse_path_valid(src_ip, iif, mode):
+    r = fib_lookup(dst = src_ip)
+    if r == NULL: return false
+    if mode == STRICT: return (r.dev == iif)
+    if mode == LOOSE:  return true
+    return true
+
+function fib_lookup_with_rules(dst, iif, src, mark):
+    for rule in rules_by_priority():
+        if rule.matches(iif=iif, src=src, dst=dst, mark=mark):
+            r = fib_lookup_in_table(rule.table, dst)
+            if r != NULL: return r
+    return fib_lookup_in_table(MAIN, dst)
+
+function br_handle_frame(skb):
+    learn_fdb(src_mac(skb), skb->dev)
+    if dst_is_local_or_broadcast(skb):
+        return BR_DELIVER_TO_L3
+    port = fdb_lookup(dst_mac(skb))
+    if port != NULL:
+        forward_to_port(skb, port); return BR_FORWARDED_L2
+    flood_except(skb->dev); return BR_FORWARDED_L2
+----
+
+=== Côté Sortie (TX) : qdisc egress, scheduling et TX ring
+
+**`dev_queue_xmit(skb)` : entrée egress**
+- Lorsqu’IP a décidé d’envoyer via `oif`, il appelle **`dev_queue_xmit(skb)`**.
+- Cette fonction **enfile le paquet dans la `qdisc` egress** attachée à l’interface.
+
+**qdisc (queueing discipline)**
+- C’est la “boîte aux lettres” + “ordonnanceur” de sortie : **elle décide quand et dans quel ordre** sortir les paquets.
+- Exemples : `pfifo_fast` (FIFO par défaut historique), `fq_codel` (latence), `htb` (hiérarchie + rate), `tbf` (rate simple), `fq` (pacing par flux).
+- **`tc`** configure la qdisc, ses **classes** (pour les classful comme `htb`) et ses **filtres** (u32, flower, …).
+
+**Dequeue → Driver (TX ring)**
+- La qdisc appelle un **scheduler** pour **défile** (`dequeue`) un paquet prêt.
+- Puis elle appelle le driver pour **mettre le paquet dans le TX ring** (DMA) et **déclencher l’envoi**.
+
+**BQL (Byte Queue Limits)**
+- Mécanisme **BQL** ajuste dynamiquement la profondeur du **TX ring** pour **éviter la bufferbloat** côté driver.
+
+**Pseudo-code (TX)**
+
+[source,c]
+----
+function dev_queue_xmit(skb):
+    qdisc = skb->dev->qdisc
+    if qdisc.enqueue(skb) == DROP:
+        kfree_skb(skb); return
+    qdisc_run(qdisc)
+
+function qdisc_run(qdisc):
+    while (skb = qdisc.dequeue()) != NULL:
+        if driver_xmit(skb->dev, skb) == BUSY:
+            qdisc.requeue(skb)
+            break
+----
+
+=== “ingress qdisc” : filtre oui, scheduling non
+
+- historiquement, les qdisc sont **egress** (sortie).
+- ce qu’on appelle **“ingress qdisc”** est un **point de filtrage** (via `clsact/ingress`), **pas** un scheduler.
+- on peut **matcher** et **drop** en entrée, voire **rediriger** vers une interface **`ifb`** pour… **façonner l’ingress** (en réalité, on fait de l’egress sur `ifb`, donc ça permet un “shaping d’ingress” indirect).
+
+**Exemple (ingress filtering + redirection ifb)**
+
+[source,bash]
+----
+# Activer le hook ingress
+tc qdisc add dev eth0 handle ffff: ingress
+
+# Dropper en entrée (filtrage)
+tc filter add dev eth0 parent ffff: protocol ip u32 match ip dst 10.0.0.0/8 drop
+
+# (Optionnel) Rediriger l'ingress vers ifb0 pour faire du shaping
+modprobe ifb
+ip link add ifb0 type ifb
+ip link set ifb0 up
+tc qdisc add dev ifb0 root tbf rate 10mbit burst 32kbit latency 400ms
+tc filter add dev eth0 parent ffff: \
+  protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
+----
+
+=== Multi-queues, RPS/RFS, XPS (scalabilité CPU)
+
+- Les NIC modernes ont **plusieurs RX/TX queues** (par **CPU** ou par **flux**) → parallélisme.
+- **RPS/RFS** (Receive Packet Steering/Flow Steering) répartissent le traitement RX entre CPU.
+- **XPS** (Transmit Packet Steering) choisit la **TX queue** selon le CPU/flux pour mieux respecter l’affinité cache.
+- L’**affinité IRQ** (par `irqbalance` ou manuel) associe les queues à des CPUs.
+
+=== Quand, à quelle “fréquence”, le noyau consulte-t-il les queues ?
+
+- **RX** :
+- **IRQ** réveille le système au 1er paquet, puis **NAPI poll** lit en **batch** jusqu’à un **budget** fixé (ex. 64 paquets) ou jusqu’à vider le ring.
+- Si le ring se vide, **l’IRQ est réactivée** ; sinon, on **reprogramme le poll** *immédiatement* (softirq `NET_RX`), sans timer périodique fixe.
+- Ce **rythme est adaptatif** : plus il y a de trafic, plus le poll tourne.
+
+- **TX** :
+- La **qdisc** se réveille **à chaque enqueue** (`dev_queue_xmit`) et **tant qu’il y a du débit**.
+- Certains qdisc (ex. `fq`) font du **pacing** (espacement dans le temps) pour lisser le débit.
+- Le **driver** signale les complétions TX (interruptions) pour libérer les buffers et permettre de déqueuer plus.
+
+👉 Il n’y a **pas** de “cron” qui scanne les files à intervalle fixe.
+Ce sont des **évènements** (IRQ, softirq, budget NAPI, enqueue qdisc, complétions driver) qui rythment le traitement.
+
+=== Résumé express
+
+- **Entrée** : **RX ring** + **IRQ → NAPI poll** (batch) → `netif_receive_skb` → pile L2/L3.
+- **Sortie** : `dev_queue_xmit` → **qdisc egress** (ordonnancement, shaping) → **driver TX** (TX ring) → fil/veth.
+- **Ingress qdisc** : **filtre/hook**, pas un scheduler ; pour “shaper” l’ingress, on **redirige vers `ifb`** et on **shape en egress** dessus.
+- **Rythme** : **évènementiel et adaptatif** (IRQ/NAPI/softirq côté RX, enqueue/pacing/completion côté TX).
+
+Pour continuer nous irons un peu plus en détail dans les explications et rappelerons les informations suivantes:
+
+Il existe trois composants centraux dans la gestion du traffic réseau:
+
+. La NIC ou carte réseau, dont la responsabilité est de fournir des trames ethernet au driver réseau du kernel.
+La NIC dépose ses trames dans la RAM dans une file d'attente appelé RX RING spécifique à l'interface.
+. Le driver réseau, c'est un composant spécifique à la carte, capable de récupérer les trames que la NIC a posé dans la RX RING, et de créer la struct central de la pile L2/L3 du kernel, des skb.
+Il spécifie dans ce skb toutes les informations de contexte:
+* `skb->dev` → l’interface d’entrée (device struct, `struct net_device *`)
+* `skb->ingress_ifindex` → index numérique de l’interface d’entrée
+* `skb->mark` → marque optionnelle (utilisée en policy routing, iptables MARK)
+* `skb->priority`, `skb->protocol`, etc.
+Il passe ensuite le skb à la couche réseau générique du kernel en synchrone via netif_receive_skb.
+. La couche L2/L3 générique du kernel.
+Elle récupère le skb et passe à travers une succession de vérifications, dans les grandes lignes les voicis:
+* interface dans un bridge, look FDB (Forwarding Table) forward ou flood ? (avec apprentissage MAC)
+* eth_type (ipv6, v4 arp ? ), transfère vers la méthode correspondante
+* Netfilter : PREROUTING Chain (RAW -> MANGLE -> NAT)
+* policy_routing
+* rp_filter
+* netfilter => iptables
+* traffic control
+* traffic interne ou autre forward ?
+* post routing
+
+Il est très important de saisir :
+
+* qu'en interne, la décision de forward appelle la méthode netif_receive_skb en changeant la skd->dev (ce qui refait partir dans le cycle de décision).
+* qu'en externe le skb est fournit au driver spécifique de la NIC qui écrit dans TX RING pour transfère réseau.
+
+
+. Chaque interface dispose:
+.. d'une RX ring dans la RAM, c'est le buffer des trames ethernet, alimenté par la NIC via DMA.
+
+
+Analysons donc le flux très précisément d'un pod A veut envoyer un paquet ip à une pod B, en inter-noeuds.
+
+* Le pod cherche par lui-même à ajouter l'adresse mac de destination.
+Il dispose d'une table ARP (pour rappel son interface est dans un namespace isolé), cherche l'adresse mac dans sa table de correspondance.
+* Lorsqu'il ne connait pas l'adresse mac, il lance une requête ARP (who as ...). Il l'ajoute à la qdisc egress de son interface, la pile L2/L3 récupère le paquet, lit les informations de routage, comprends qu'il est à destination de la cni0 grâce à l'ip, encapsule dans une nouvelle trame, change le skb->dev, mets en RX queue sur la cni0. La couche L2/L3 récupère le paquet, lit les informations, constate que c'est une requête ARP, consulte la table fdb, et comprends qu'il faut transférer le paquet vers la vxlan0, sous forme de flood.
+Elle créé autant de paquets qu'il y a de noeuds, set la skb->dev des paquets à vxlan0, et ajoute les paquets dans la RX ring de la vxlan0. La vxlan0 récupère les paquets, les encapsule dans des paquets udp, encapsule dans une trame et envoie cela aux différentes interfaces de tous les noeuds.
+
+Continuons sur un noeud.
+
+L'interface vxlan de l'autre noeud, ou plus précisément sa couche kernel spécifique au driver programme une tâche de pooling (via IRQ depuis la NIC vers le CPU, et ISR vers le driver network).
+
+La couche L2/L3 désencapsule le paquet udp, et ajoute le skb à la RX ring de l'interface machine, disons ens160. la couche L2/L3 de l'ens160 récupère le paquet
+
+
+
+
+
+
+
+
+
+

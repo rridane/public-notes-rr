@@ -1,0 +1,741 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+
+=  Cilium et eBPF - La révolution du datapath
+
+Cilium est un CNI qui utilise la technologie **eBPF** (extended Berkeley Packet Filter) pour fournir networking, observability et sécurité dans Kubernetes. Contrairement aux approches traditionnelles qui reposent sur iptables ou même IPVS, Cilium déplace la logique de traitement des paquets directement dans le noyau Linux via des programmes eBPF, offrant ainsi des performances et une flexibilité inédites.
+
+[IMPORTANT]
+====
+Cette fiche est le prolongement direct de deux autres documents, référencés en permanence :
+
+* **la fiche « Deep dive in kubernetes networking »** — quand cette fiche dit « la maquette », « le flux VXLAN Flannel » ou « la section kube-proxy », c'est là-bas que ça se passe. Les conventions d'adressage sont les siennes (PodCIDR `10.244.X.0/24`, underlay `10.33.18.0/24`) ;
+* **le schéma `linux_kernel_paquet_journey`** — le chemin d'un paquet dans le kernel, avec les quatre points d'ancrage eBPF et les cinq sorties de `__netif_receive_skb_core`. Le flux détaillé ci-dessous se lit ce schéma sous les yeux.
+
+Sans ces deux pré-requis, lire d'abord la fiche réseau.
+====
+
+== Principes de base d'eBPF
+
+* **eBPF** permet d'exécuter des programmes sandboxés dans le noyau Linux sans en modifier le code source.
+* Ces programmes s'attachent à des **hooks** du noyau
+* Ils opèrent sur les paquets réseau et les connexions avec un overhead minimal.
+* Les **maps eBPF** sont des structures de données partagées entre l'espace noyau et utilisateur pour stocker états, règles et métriques.
+
+
+=== Exemple minimal : map + hook + verdict
+
+Le programme ci-dessous est une version *volontairement squelettique* de ce que fait `from-container` en phase 2 du flux : consulter une map, poser une consigne d'encapsulation, rendre un verdict. Il tient en trois gestes — c'est toute la grammaire d'un programme datapath.
+
+[source,c]
+----
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+/* LA MAP : IP de pod -> IP du nœud qui l'héberge.
+ * C'est l'« ipcache » miniature. Remplie par l'agent depuis
+ * l'userspace (état Kubernetes) — jamais par découverte. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);              /* IP destination (pod)      */
+    __type(value, __u32);            /* IP du nœud (tunnel endpoint) */
+} pod_to_node SEC(".maps");
+
+#define VXLAN_IFINDEX 42             /* ifindex de cilium_vxlan   */
+#define MY_IDENTITY   12345          /* identité du pod source    */
+
+/* LE HOOK : tc ingress de la veth du pod
+ * (sch_handle_ingress sur le schéma kernel). */
+SEC("tc")
+int from_container(struct __sk_buff *skb)
+{
+    void *data     = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    struct ethhdr *eth = data;
+    struct iphdr  *ip  = data + sizeof(*eth);
+    if ((void *)(ip + 1) > data_end ||
+        eth->h_proto != bpf_htons(ETH_P_IP))
+        return TC_ACT_OK;            /* pas de l'IPv4 : passage direct */
+
+    /* 1. la map : où vit cette destination ? */
+    __u32 *node_ip = bpf_map_lookup_elem(&pod_to_node, &ip->daddr);
+    if (!node_ip)
+        return TC_ACT_OK;            /* inconnue : pile classique */
+
+    /* 2. la consigne d'encapsulation : la tunnel key dans skb->dst */
+    struct bpf_tunnel_key key = {
+        .remote_ipv4 = bpf_ntohl(*node_ip),
+        .tunnel_id   = MY_IDENTITY,  /* l'identité voyage dans le VNI */
+    };
+    bpf_skb_set_tunnel_key(skb, &key, sizeof(key), BPF_F_ZERO_CSUM_TX);
+
+    /* 3. le verdict : bascule RX -> TX vers cilium_vxlan */
+    return bpf_redirect(VXLAN_IFINDEX, 0);  /* = TC_ACT_REDIRECT */
+}
+
+char _license[] SEC("license") = "GPL";
+----
+
+=== Ce que ce squelette montre — et ce qu'il tait
+
+Les trois gestes se projettent directement sur le schéma kernel et sur le flux :
+
+* **La map** est la signature de l'approche : le programme ne découvre rien (pas d'ARP, pas de FDB, pas de lookup FIB) — il consulte une connaissance écrite *d'en haut* par l'agent. Le paquet n'est jamais modifié ; la vérification des bornes (`data_end`) est imposée par le vérificateur eBPF, c'est le prix d'entrée dans le kernel.
+* **Le hook** est le losange tc ingress du schéma : le programme s'exécute dans `__netif_receive_skb_core`, avant le bridge, avant `ip_rcv`, avant netfilter.
+* **Le verdict** est la sortie `TC_ACT_REDIRECT` du schéma : `bpf_skb_set_tunnel_key` réquisitionne `skb->dst` (la consigne d'encapsulation à la place de la route), `bpf_redirect` bascule le skb du pipeline RX au pipeline TX de `cilium_vxlan`. Exactement la phase 2 du flux.
+
+Ce que le vrai `from-container` ajoute par-dessus ce squelette — et qui fait la différence entre 40 lignes et plusieurs milliers : le conntrack BPF (créer/retrouver l'entrée de connexion), la policy par identités (le lookup A -> C avant de laisser passer), la gestion des cas particuliers (ICMP, fragmentation, IPv6, proxy L7), et le découpage en tail calls pour tenir dans les limites du vérificateur. La grammaire reste la même : des maps, un hook, un verdict.
+
+== Deep dive on cilium
+
+[plantuml,cilium-flow,png]
+----
+@startuml cilium_topologie
+' Topologie statique — Cilium kube-proxy-free, VXLAN
+' Mêmes conventions que la fiche : PodCIDR 10.244.X.0/24, underlay 10.33.18.0/24
+
+title Topologie Cilium — 2 nœuds, 4 pods
+
+skinparam defaultTextAlignment center
+skinparam nodesep 40
+skinparam ranksep 50
+
+node "node1\nens160 : 10.33.18.10/24\nPodCIDR : 10.244.1.0/24" as node1 {
+  rectangle "cilium_host\n10.244.1.1\n(gateway des pods)" as gw1
+  rectangle "cilium_vxlan\n(pas d'IP)" as vx1
+
+  frame "pod1\nidentité A" as n1p1 {
+    rectangle "eth0\n10.244.1.2" as n1p1e
+  }
+  frame "pod2\nidentité B" as n1p2 {
+    rectangle "eth0\n10.244.1.3" as n1p2e
+  }
+
+  rectangle "lxc-pod1\n(veth, pas d'IP)" as lxc11
+  rectangle "lxc-pod2\n(veth, pas d'IP)" as lxc12
+}
+
+node "node2\nens160 : 10.33.18.11/24\nPodCIDR : 10.244.2.0/24" as node2 {
+  rectangle "cilium_host\n10.244.2.1\n(gateway des pods)" as gw2
+  rectangle "cilium_vxlan\n(pas d'IP)" as vx2
+
+  frame "pod1\nidentité C" as n2p1 {
+    rectangle "eth0\n10.244.2.2" as n2p1e
+  }
+  frame "pod2\nidentité D" as n2p2 {
+    rectangle "eth0\n10.244.2.3" as n2p2e
+  }
+
+  rectangle "lxc-pod1\n(veth, pas d'IP)" as lxc21
+  rectangle "lxc-pod2\n(veth, pas d'IP)" as lxc22
+}
+
+cloud "underlay 10.33.18.0/24" as net
+
+n1p1e -- lxc11 : veth pair
+n1p2e -- lxc12 : veth pair
+n2p1e -- lxc21 : veth pair
+n2p2e -- lxc22 : veth pair
+
+node1 -- net : 10.33.18.10
+node2 -- net : 10.33.18.11
+vx1 .. vx2 : tunnel VXLAN\nUDP 8472
+
+note as svc
+  Services (ClusterIP 10.96.0.0/16) :
+  portés par aucune interface —
+  uniquement des entrées dans les
+  maps eBPF de chaque nœud
+end note
+
+note bottom of node1
+  Pas de bridge cni0 : chaque lxc est
+  autonome, le routage pod<->pod est
+  fait par les programmes tc/eBPF
+end note
+@enduml
+----
+
+=== Pré-requis
+
+**Lecture** : le schéma de topologie ci-dessus, et la fiche kernel — comprendre ce flux nécessite impérativement d'avoir le schéma `linux_kernel_paquet_journey` sous les yeux, ou de maîtriser parfaitement le chemin d'un paquet dans le kernel Linux. Le flux VXLAN Flannel de cette fiche sert de point de comparaison permanent.
+
+**Configuration** : Cilium en mode **kube-proxy-free** (socket-LB activée) et **tunnel VXLAN**.
+
+**Scénario** : `curl http://10.96.0.42:80` depuis pod1-node1 (`10.244.1.2`, identité A). Le Service ClusterIP `10.96.0.42:80` a pour backend pod1-node2 (`10.244.2.2:8080`, identité C).
+
+**État initial — ce que Cilium a posé dans le pod au CNI ADD** : le flux part d'un pod déjà câblé. Au moment du CNI `ADD`, l'agent a exécuté (via netlink) l'équivalent suivant dans le netns du pod — à comparer avec `set_ip_and_mask_to_interface_in_namespace` et `add_route_on_namespace` de la maquette :
+
+[source,bash]
+----
+# équivalent de ce que fait cilium-cni dans le netns de pod1-node1
+ip -n node1-pod1 addr  add 10.244.1.2/32 dev eth0                 # <1>
+ip -n node1-pod1 route add 10.244.1.1/32 dev eth0 scope link      # <2>
+ip -n node1-pod1 route add default via 10.244.1.1 dev eth0        # <3>
+ip -n node1-pod1 neigh add 10.244.1.1 lladdr <MAC de lxc-pod1> \
+                 dev eth0 nud permanent                           # <4>
+----
+<1> IP en **/32** — pas en /24 comme dans la maquette. Rien n'est *on-link* : le pod ne peut (et ne doit) ARPer personne, puisqu'il n'existe aucun segment L2 partagé.
+<2> Rend la gateway joignable sur le lien malgré le /32 (sans cette route `scope link`, la default de <3> serait rejetée : gateway dans aucun réseau connu).
+<3> Route par défaut classique vers `cilium_host` (10.244.1.1).
+<4> **La réponse ARP, pré-écrite.** Entrée voisin statique (`nud permanent` : jamais expirée, jamais revalidée) pointant vers la MAC du côté host de la veth.
+
+Pourquoi <4> est une nécessité et pas une optimisation : dans la maquette, `who has 10.244.1.1` traversait la veth et **cni0 répondait** — le bridge portait l'IP et était raccordé en L2 au pod. Chez Cilium, il n'y a plus de répondeur : `lxc-pod1` n'a pas d'IP, et `cilium_host` (qui porte 10.244.1.1) n'a aucun lien L2 avec la veth. En supprimant le bridge, Cilium a supprimé le répondeur ARP ; il pré-écrit donc la réponse. Conséquence dans le flux : `neigh_resolve_output` trouvera une entrée valide et passera directement à `skb_push` — la machinerie ARP ne sera jamais sollicitée.
+
+La valeur exacte de cette MAC importe peu : `from-container` ne vérifie pas la MAC destination, et côté livraison `ipv4_local_delivery` réécrit les MAC depuis la map `cilium_lxc`. L'entrée PERMANENT est un bouchon administratif pour satisfaire le kernel du pod — la vraie décision d'acheminement se prend une étape plus loin, dans le programme BPF.
+
+Vérifiable sur n'importe quel pod d'un cluster Cilium :
+
+[source,bash]
+----
+kubectl exec <pod> -- ip neigh show    # -> 10.244.X.1 ... PERMANENT
+kubectl exec <pod> -- ip route         # -> /32 + scope link + default via
+----
+
+Trois commandes qui suffisent à distinguer un CNI à bridge (adresse /24, ARP dynamique) d'un Cilium (adresse /32, voisinage figé).
+
+
+=== Phase 0 — le syscall connect() : le Service meurt avant le premier paquet
+
+L'application appelle `connect(10.96.0.42:80)`.
+Chemin kernel : `LOCAL_SOCKET` -> `hook cgroup (__cgroup_bpf_run_filter_sock_addr())` -> programme cilium `cil_sock4_connect` (attaché au cgroup racine, donc tous les process du nœud).
+
+Le programme fait un lookup dans la map `cilium_lb4_services_v2` avec la clé `{10.96.0.42, 80}` -> hit -> sélection d'un backend dans `cilium_lb4_backends` -> il **réécrit la structure d'adresse de la socket** : destination = `10.244.2.2:8080`. Le syscall continue normalement (`tcp_v4_connect`)... vers le backend.
+
+Point capital : **aucun skb n'existe encore**. La ClusterIP ne sera portée par aucun paquet de cette connexion — le handshake TCP entier naît avec `dst = 10.244.2.2`. (`getpeername()` est intercepté par un hook symétrique qui re-ment à l'application pour lui montrer la ClusterIP.)
+
+À comparer avec kube-proxy : la ClusterIP n'existait déjà que comme cible de règles DNAT — même idée, mais la traduction est déplacée du paquet (à chaque paquet) vers la socket (une fois).
+
+Voir hook cgroup sur schéma juste après local socket pour comprendre que linux ignore totalement l'existence de ce service et de son ip.
+
+=== Phase 1 — la pile du pod (netns pod1-node1)
+
+`send_msg -> tcp_transmit_skb` -> `ip_queue_xmit` : lookup FIB *du pod* -> `default via 10.244.1.1` (cilium_host).
+`neigh_resolve_output` : **pas de requête ARP** — l'agent Cilium a posé à la création du pod une entrée voisin `PERMANENT` pour la gateway (voir pré requis si ce n'est pas clair).
+`skb_push` (dst MAC = côté host de la veth) -> `dev_queue_xmit` -> veth = `noqueue`, pas de file -> `veth_xmit -> netif_rx` : le skb ressort côté hôte.
+
+A ce stade nous avons :
+- `ip paquet : 10.244.1.2 -> 10.244.2.2` (déjà le backend, plus la ClusterIP)
+- `skb->dev : lxc-pod1` (on a changé de netns)
+- `dst_mac : MAC host-side de la veth`
+
+=== Phase 2 — from-container : la sortie précoce
+
+Le skb entre dans `__netif_receive_skb_core` sur lxc-pod1. Première étape, les taps `ptype_all` : **`tcpdump -i lxc-pod1` voit le paquet** — dernier point d'observation classique. Puis `sch_handle_ingress()` exécute le programme `from-container`, qui répond à trois questions, dans l'ordre :
+
+. **Est-ce que je connais cette connexion ?** Non : c'est le premier paquet, aucune entrée dans le conntrack BPF (`cilium_ct4_global`). Le programme **l'enregistre**. Tout l'intérêt vient après : les paquets suivants — et surtout le retour — matcheront cette entrée (état REPLY) et seront acceptés d'office, sans re-vérifier la policy. C'est le stateful.
+. **Où vit 10.244.2.2, et qui est-ce ?** Lookup dans l'ipcache : identité C, hébergé par le nœud `10.33.18.11`.
+. **A a-t-il le droit de parler à C sur :8080 ?** Policy par identités : allow. (Refus = drop ici même, la sortie "drop" du schéma.)
+
+Verdict :
+
+* **Le skb est modifié** : le programme réquisitionne son champ `dst` et y met à la place une **tunnel key** : `{nœud destination = 10.33.18.11, VNI = identité A}`. Le champ change de nature : il ne dit plus « voici la route », il dit « voici la consigne d'encapsulation ».
+* **Le paquet n'est pas touché** : dst reste `10.244.2.2`. Aucun en-tête réécrit, donc pas de NAT — et rien à défaire au retour.
+
+Le programme retourne **`TC_ACT_REDIRECT`** avec pour cible `cilium_vxlan` — sur le schéma, c'est la sortie TC_ACT_REDIRECT : `skb->dev = cilium_vxlan`, `dev_queue_xmit`, le paquet bascule du pipeline RX au pipeline TX. C'est la tunnel key posée dans `skb->dst` qui permettra au driver vxlan, en phase 3, de construire le bon paquet UDP vers la bonne cible.
+
+**Jamais traversés** : le test rx_handler (pas de bridge), `ip_rcv`, PREROUTING, la décision input/forward, FORWARD, le lookup FIB hôte, POSTROUTING, `neigh_resolve_output`. Tout le segment que le flux VXLAN Flannel passait dans la pile IP hôte (FIB -> FORWARD -> ARP floodé via le bridge) est enjambé d'un bond.
+
+=== Phase 3 — cilium_vxlan : encapsulation pilotée par métadonnées
+
+`dev_queue_xmit(cilium_vxlan)` -> `sch_handle_egress()` -> `to-overlay` (quasi passthrough).
+Le device vxlan est en mode **collect-metadata** : **aucune FDB consultée** — pas d'entrée `00:00:00:00:00:00` comme dans la maquette Flannel. Il lit la tunnel key posée en phase 2 et construit l'enveloppe :
+
+- outer : `10.33.18.10 -> 10.33.18.11`
+- UDP dstport **8472** (défaut Cilium — pas 4789 ; un tcpdump filtré sur 4789 ne voit rien)
+- VNI = **identité A** (l'identité source voyage dans le header)
+
+=== Phase 4 — l'enveloppe refait toute la pile hôte
+
+Le paquet externe est un UDP local banal : `ip_local_out` -> LOCAL_OUT -> lookup FIB (`10.33.18.11` via ens160) -> POSTROUTING -> `neigh_resolve_output` — **ici l'ARP classique peut réellement avoir lieu** (next-hop underlay) -> `skb_push` -> `dev_queue_xmit(ens160)` -> tc egress -> qdisc réelle (interface physique) -> taps TX (**`tcpdump -i ens160` voit de l'UDP 8472**) -> TX ring -> NIC.
+
+=== Phase 5 — réception node2, jusqu'à la décapsulation
+
+NIC -> RX ring -> hook XDP (`cil_xdp_entry` si accélération active ; paquet tunnel -> `XDP_PASS`) -> skb -> GRO -> `__netif_receive_skb_core(ens160)` : taps -> `from-netdev` (programme cilium) -> `TC_ACT_OK` -> `ip_rcv` -> PREROUTING -> `10.33.18.11` est locale -> INPUT -> socket UDP 8472 -> `vxlan_rcv` décapsule, extrait le `tunnel_id` (identité A), réinjecte le paquet interne comme « reçu » par `cilium_vxlan`.
+
+Cette réinjection est structurellement analogue à la boucle `another_round` du bridge : mêmes étapes, nouveau `skb->dev`, nouvelles listes de programmes.
+
+[NOTE]
+====
+Le DNAT per-packet n'a pas totalement disparu : il subsiste sur le seul chemin où aucun `connect()` local n'a eu lieu — un NodePort venu de l'extérieur. Là, `from-netdev` (tc ingress de ens160, voire XDP) fait le DNAT, et le retour passe par `lb4_rev_nat` via la map `cilium_lb4_reverse_nat`. Deux mécanismes de LB coexistent donc : socket-LB (sans NAT) pour le trafic né sur le nœud, per-packet (DNAT + rev-NAT en BPF) pour le trafic entrant.
+====
+
+=== Phase 6 — from-overlay : la livraison eBPF jusqu'au pod destinataire
+
+Le paquet interne entre pour la seconde fois dans `__netif_receive_skb_core`, cette fois avec `skb->dev = cilium_vxlan`. Première étape, les taps : **`tcpdump -i cilium_vxlan` voit le paquet interne** (10.244.1.2 -> 10.244.2.2). Puis `sch_handle_ingress()` exécute le programme cilium `from-overlay`, qui répond à trois questions :
+
+. **Qui est l'expéditeur ?** Déjà su : l'identité A a voyagé dans l'enveloppe (le VNI, extrait à la décapsulation). Aucun lookup nécessaire — c'est le luxe du mode tunnel.
+. **Où livrer 10.244.2.2 ?** Lookup dans l'annuaire local des pods (la map `cilium_lxc`) : c'est le pod derrière lxc-pod1, avec sa MAC et celle du côté host. Le programme réécrit les MAC de la trame et décrémente le TTL — le travail que `neigh_resolve_output` + `skb_push` font dans le monde classique, refait ici depuis une map, sans ARP (et pour cause : personne ne répondrait, cf. pré-requis).
+. **C accepte-t-il du trafic de A sur :8080 ?** Policy ingress, par identités : allow. Une entrée conntrack ingress est créée au passage — la réponse du pod matchera en REPLY.
+
+Verdict : **`TC_ACT_REDIRECT`** à nouveau — mais dans sa variante *peer* : au lieu de basculer le skb vers le TX d'un device (comme en phase 2), il est déposé directement **à l'entrée du netns du pod**, sur son eth0. Le paquet saute même la traversée de la veth : pas de passage par l'egress du lxc, pas de re-traversée de la pile hôte. Il re-entre dans une boîte `__netif_receive_skb_core` — celle du pod cette fois, hooks vides — puis `ip_rcv` -> INPUT -> la socket :8080. Servi.
+
+=== Le retour
+
+pod1-node2 répond : `10.244.2.2:8080 -> 10.244.1.2`. Le paquet refait le même voyage en miroir — mêmes hooks, mêmes phases, rien de nouveau à apprendre. Deux choses seulement méritent l'attention :
+
+**Le stateful paie.** Aux deux endroits où l'aller avait créé une entrée conntrack (phases 2 et 6), le retour la retrouve : état REPLY, accepté d'office, aucune re-vérification de policy. C'était la promesse du « le programme l'enregistre » — la voici tenue.
+
+**Aucun NAT à défaire.** La socket du client attend des paquets venant de `10.244.2.2` — elle y est connectée depuis la phase 0. La réponse arrive donc telle quelle, sans qu'aucune réécriture ne soit nécessaire nulle part. Toute la gymnastique « conntrack défait le DNAT au retour » de la section kube-proxy a disparu avec sa cause : on ne défait que ce qu'on a fait, et ici rien n'a été fait au paquet.
+
+=== Carte de visibilité (debugging)
+
+tcpdump voit le paquet *interne* en deux points exactement : les taps du lxc source (avant le programme BPF) et ceux du chemin de livraison côté destination. Il voit l'*enveloppe* (UDP 8472) sur ens160 des deux côtés. Il est aveugle partout ailleurs — les segments enjambés par `ctx_redirect`/`redirect_peer` ne contiennent aucun tap.
+`cilium monitor` écoute, lui, les événements émis par les programmes eux-mêmes (trace, drop, verdict de policy) — c'est-à-dire précisément les segments invisibles. Les deux outils sont complémentaires par construction.
+
+=== Ce qui n'est plus sous la responsabilité du kernel (ou plus exactement : qui pilote quoi)
+
+Le flux ci-dessus montre un déplacement systématique. Partout où le réseau classique **découvre** (ARP, FDB, flood) ou **consulte des structures génériques du kernel** (FIB, règles DNAT, conntrack netfilter), Cilium substitue une **connaissance pré-programmée** dans des maps eBPF, dérivée de l'état Kubernetes par l'agent. Le bridge *apprenait* la topologie en observant le trafic ; Cilium la *connaît* d'avance et la programme.
+
+[cols="1,1,1"]
+|===
+| Fonction | Mécanisme classique | Chez Cilium
+
+| Annuaire des pods locaux (qui est derrière quelle interface)
+| FDB du bridge cni0, apprise par flood/ARP
+| map `cilium_lxc` (IP -> ifindex veth + MACs + lxc_id), écrite par l'agent
+
+| Forwarding pod->pod même nœud
+| commutation L2 dans le bridge
+| lookup `cilium_lxc` + `bpf_redirect_peer()` (dépôt direct dans le netns cible)
+
+| Gateway des pods
+| cni0 (IP d'admin du bridge)
+| `cilium_host` (simple veth qui porte 10.244.X.1 — rien n'y est raccordé en L2)
+
+| Résolution du next-hop pod
+| ARP (who has 10.244.X.1)
+| entrées voisin `PERMANENT` posées à la création du pod
+
+| Routage inter-nœuds (quel nœud héberge cette IP)
+| FIB hôte (routes statiques, BGP...)
+| map `cilium_ipcache` (IP -> identité + tunnelendpoint), consultée en tc
+
+| Destination du tunnel VXLAN
+| FDB du device vxlan (entrée 00:00:00:00:00:00 dst <node>)
+| tunnel key posée par le programme BPF, paquet par paquet (mode collect-metadata)
+
+| Mapping Service -> backend
+| règles DNAT iptables / IPVS (per-packet)
+| socket-LB au connect() (maps `cilium_lb4_*`) ; per-packet BPF pour le NodePort entrant
+
+| Suivi de connexion
+| conntrack netfilter
+| maps CT propres (`cilium_ct4_global`), indépendantes de netfilter
+
+| Policy réseau
+| iptables (match par IP, parcours linéaire)
+| lookup par **identité** (paires d'identités, stable au churn des IP, coût constant)
+|===
+
+Deux nuances pour ne pas sur-simplifier :
+
+* **Le kernel reste l'exécutant partout.** Les programmes eBPF *sont* du code kernel (vérifié, JIT-é), les hooks sont des API officielles (`clsact`/TCX, XDP, cgroup-BPF), et le moteur VXLAN reste le driver standard — il a seulement perdu son autonomie : le *cerveau* (vers quel nœud, quel VNI) a déménagé dans le BPF, le *moteur* d'encapsulation n'a pas bougé. Ce qui change n'est pas « kernel vs pas kernel », mais **structures génériques auto-alimentées** (FDB, ARP, FIB, conntrack) vs **maps dédiées alimentées par un plan de contrôle** (l'agent, depuis l'API Kubernetes).
+* **L'enveloppe tunnel, elle, vit intégralement dans le monde classique** : FIB, ARP réel, POSTROUTING, qdisc — tout le schéma kernel s'applique au paquet externe.
+
+Conséquence directe pour le debugging : `ip neigh`, `bridge fdb show`, `ip route` et `iptables -t nat -L` deviennent muets là où ils racontaient tout sur la maquette. La vérité a déménagé dans :
+
+[source,bash]
+----
+cilium map get cilium_lxc          # l'annuaire local (ex-FDB)
+cilium map get cilium_ipcache      # identités + tunnel endpoints (ex-FIB pod)
+cilium-dbg bpf lb list             # services -> backends (ex-KUBE-SVC/SEP)
+cilium-dbg bpf ct list global      # conntrack BPF (ex-conntrack -L)
+bpftool net show                   # quels programmes sur quelles interfaces
+tc filter show dev lxcXXX ingress  # l'attachement from-container (clsact)
+----
+
+[NOTE]
+====
+**Pourquoi Cilium prend de plus en plus de place : c'est un absorbeur de briques.** Là où chaque fonction demandait avant un composant séparé — kube-proxy (iptables/IPVS), MetalLB (exposition de VIP), keepalived/HAProxy (failover), le CNI de routage (Calico/Flannel), les NetworkPolicy iptables, une pile d'observabilité réseau, WireGuard monté à la main, Submariner (multi-cluster), un morceau de service mesh — Cilium les reprend dans **un seul datapath eBPF piloté par l'agent**. La policy passe de l'IP à l'identité, l'observabilité devient Hubble, l'exposition et le chiffrement sont intégrés.
+
+Le revers : cette consolidation **concentre le risque**. L'agent devient un point critique unique, et une montée de version touche d'un coup le routage, l'exposition, la policy et l'observabilité. C'est un arbitrage — excellent quand on maîtrise la plateforme, à assumer consciemment.
+====
+
+== Exposition nord-sud : le Service `LoadBalancer` (LB-IPAM + L2 announcement / BGP)
+
+Tout le flux précédent est **est-ouest** (pod↔pod, phases 0-6). Côté services, on a couvert deux entrées : la **socket-LB** au `connect()` (ClusterIP, trafic né sur le nœud, phase 0) et le **DNAT per-packet** de `from-netdev` (NodePort entrant, NOTE de la phase 5). Reste la dernière brique — celle que le NOTE « absorbeur » vient de nommer sans la montrer : le Service `type: LoadBalancer`, c'est-à-dire **donner une IP externe stable à un service, et faire en sorte que le monde extérieur la trouve**. C'est le rôle qu'occupaient MetalLB (exposition de VIP) et keepalived/HAProxy (failover). Voici comment Cilium l'absorbe — sans un composant de plus, en réutilisant le datapath déjà décrit.
+
+[IMPORTANT]
+====
+La théorie du « comment le fabric trouve une VIP » — **BGP+ECMP vs L2/ARP**, et le principe *« le load balancing se fait dans l'équipement d'en face, jamais par un partage d'IP en L2 »* — est posée dans la **fiche réseau, section _Fabric, BGP, ECMP_**. Cette section-ci ne la refait pas : elle décrit le **datapath Cilium** qui s'y branche. Lire cette section réseau d'abord si le « BGP à deux métiers » n'est pas clair.
+====
+
+=== Deux questions orthogonales
+
+Un Service `LoadBalancer` pose deux questions **indépendantes**. Cilium les traite par deux composants distincts — là où MetalLB les fusionnait dans un seul binaire :
+
+[cols="1,2"]
+|===
+| Question | Composant Cilium
+
+| **Quelle IP externe ?** (allocation)
+| **LB-IPAM** (`CiliumLoadBalancerIPPool`)
+
+| **Comment le fabric la trouve ?** (advertisement)
+| **L2 announcement** (ARP/NDP, `CiliumL2AnnouncementPolicy`) *ou* **BGP Control Plane** (`CiliumBGPPeeringPolicy`)
+|===
+
+LB-IPAM alloue **toujours** ; l'annonce (L2 ou BGP) est un choix indépendant posé par-dessus. C'est la même séparation que Calico (fiche réseau) faisait entre *l'IPAM* (qui possède quel bloc) et *le BGP* (qui annonce ce bloc) — transposée du PodCIDR à la VIP de service.
+
+=== LB-IPAM : l'allocation pure, rien d'autre
+
+Sur bare-metal, un `Service type: LoadBalancer` reste `<pending>` éternellement : aucun cloud-controller n'est là pour lui poser une IP externe. LB-IPAM comble exactement ce trou. On déclare un pool ; Cilium **pioche une IP dedans** et l'écrit dans `.status.loadBalancer.ingress` du Service.
+
+[source,yaml]
+----
+apiVersion: cilium.io/v2alpha1
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: pool-ingress
+spec:
+  blocks:
+    - start: 10.30.1.200
+      stop:  10.30.1.250
+----
+
+**Zéro dataplane.** C'est de la **comptabilité d'IP** — l'exact pendant de l'IPAM Calico (fiche réseau), mais pour des **VIP de service** au lieu des PodCIDR, et **sans BGP en propre**. « Ce service possède `10.30.1.200` ». Point. Qui, ensuite, fait *arriver* le trafic sur cette IP est une autre couche.
+
+=== L2 announcement : le répondeur ARP, réintroduit et élu
+
+Rappel de la fondation ARP (fiche réseau) : **seule la machine qui possède l'IP répond à `who has ?`**. En L2 announcement, Cilium **élit un nœud leader** (via un objet `Lease`) par VIP ; ce nœud — et lui seul — répond à l'ARP de `10.30.1.200` avec sa MAC. Tout le trafic du VIP atterrit donc sur **une seule** NIC. Il n'y a **aucune annonce de route** : rien n'est injecté dans une FIB, contrairement au BGP. Le nœud se contente de **revendiquer l'IP sur le fil**, à la couche 2.
+
+[IMPORTANT]
+====
+**La symétrie qui boucle toute la fiche.** À l'intérieur du nœud, Cilium *supprime* l'ARP : plus de bridge, donc plus de répondeur — l'agent **pré-écrit** l'entrée voisin `PERMANENT` pour la gateway (pré-requis, point <4>). Au bord du cluster, il fait l'**inverse exact** : il *réintroduit* un répondeur ARP délibéré, **élu**, pour la VIP.
+
+Même thème d'un bout à l'autre — *« Cilium contrôle qui répond à l'ARP »* — appliqué dans les deux sens : **suppression en interne** (est-ouest : plus personne ne doit répondre, la vérité est dans les maps), **revendication au bord** (nord-sud : exactement un nœud doit répondre, pour attirer le trafic externe).
+====
+
+[NOTE]
+====
+Répondre à l'ARP pour une IP qui n'est **pas** son `fixed_ip` suppose deux conditions : (1) le lien doit l'**autoriser** — pas de filtrage anti-spoof / port-security qui rejette les trames dont l'IP source/cible sort de l'adresse assignée ; (2) Cilium doit tourner en **kube-proxy replacement** — précisément le mode de toute cette fiche. Le L2 announcement ne vit donc pas « à côté » du datapath eBPF : il en **dépend**.
+
+Contrainte réseau, enfin : **l'ARP ne traverse pas les routeurs**. La VIP doit être dans le **même domaine de broadcast** que les clients (ou que la gateway de premier saut qui la résout). Sur un segment plat, ça marche. Sur un réseau virtuel de cloud où l'ARP est **émulé**, c'est à *vérifier empiriquement* : certaines plateformes ne résolvent que les IP qu'elles ont elles-mêmes assignées aux VM, ce qui casse l'annonce L2 d'un VIP flottant.
+====
+
+=== Les deux niveaux de load balancing — le point clef
+
+C'est ici que se dissout le « on ne peut pas load-balancer en L2 ». **Il y a deux étages, et l'équilibrage se fait au second.**
+
+**Étage 1 — l'ingestion L2 : un seul nœud, pas d'équilibrage.** Le nœud-leader encaisse *tout* le trafic du VIP. S'il tombe, un autre nœud envoie un **gratuitous ARP** pour voler l'IP, le segment réapprend la MAC, le trafic bascule. C'est du **failover actif-passif**, exactement le principe *« le partage L2 ne remet l'IP qu'à une machine à la fois »* de la fiche réseau.
+
+**Étage 2 — derrière ce nœud : le datapath eBPF, déjà documenté, équilibre vers tous les pods.** Une fois le paquet sur la NIC du leader, il emprunte **le chemin du NodePort entrant** de la phase 5 : `from-netdev` fait le DNAT via `cilium_lb4_services_v2`, choisit un backend dans `cilium_lb4_backends` — **n'importe quel pod, sur n'importe quel nœud** — et le retour repasse par `lb4_rev_nat` (`cilium_lb4_reverse_nat`). Le second saut nœud→pod est le datapath habituel (`redirect_peer` si le pod est local, tunnel VXLAN s'il est distant).
+
+[source,text]
+----
+client
+  │  ARP: who has 10.30.1.200 ?
+  ▼
+nœud-leader (élu, répond seul)              ← ÉTAGE 1 : ingestion, 1 nœud (failover)
+  │  from-netdev : DNAT via cilium_lb4_services_v2
+  ▼
+eBPF service-LB → pod backend (tout nœud)   ← ÉTAGE 2 : LB réel (le datapath est-ouest)
+  ├──► ingress-pod @ node1   (tunnel VXLAN)
+  ├──► ingress-pod @ node2   (redirect_peer, local)
+  └──► ingress-pod @ node3   (tunnel VXLAN)
+----
+
+**Conséquence.** Sans ECMP : **pas** d'équilibrage à l'ingestion (le plafond est le débit de la NIC du nœud-leader), **mais** un vrai équilibrage vers les pods (les N réplicas d'un ingress controller reçoivent tous du trafic). Pour un ingress, c'est le second étage qui compte — le premier n'est qu'un point d'entrée + une unité de failover, pas un goulot par-pod.
+
+[NOTE]
+====
+Pattern propre pour un ingress en L2 : ingress controller en **DaemonSet** + `externalTrafficPolicy: Local`. Le nœud-leader tape alors **son propre** pod ingress local — IP source du client préservée (pas de SNAT), pas de hop inter-nœud. À rapprocher du déploiement `hostPort`/`hostNetwork` de l'ingress-nginx bare-metal évoqué dans la fiche réseau : même intention (attirer le trafic externe sur le nœud, sans LB cloud), mais ici la VIP est portable et le failover est géré par l'élection de leader au lieu d'être clouée à un nœud.
+====
+
+=== La variante BGP : étaler l'ingestion (le seul vrai actif-actif)
+
+Là où le fabric parle BGP (**peering + ECMP** — cf. fiche réseau), on remplace l'annonce L2 par le **BGP Control Plane** de Cilium : chaque nœud **annonce en BGP le `/32` alloué par LB-IPAM**, le routeur reçoit N routes de coût égal et **répartit par ECMP**. L'ingestion devient **multi-nœud actif-actif** — le seul mode qui étale réellement *l'entrée* (l'étage 1), et pas seulement la distribution vers les pods (l'étage 2).
+
+[NOTE]
+====
+**L'écueil ECMP, et ce que Maglev protège (précisément).** Un routeur ECMP naïf **rebat le hash** au changement de topologie (nœud ajouté/retiré) : des flux existants basculent vers un autre nœud d'ingestion. Cilium atténue au **second saut** grâce à son hash consistant **Maglev** : même si un flux rebattu atterrit sur un *autre* nœud, ce nœud sélectionne **le même backend** — la couche *service* reste cohérente.
+
+Nuance honnête, pour ne pas surestimer : Maglev stabilise le **choix de backend**, pas la **session TCP** si le rebattement change le nœud qui porte le conntrack/SNAT (`externalTrafficPolicy: Cluster`). Le rebattement au niveau routeur reste une propriété du **fabric** ; Maglev limite la casse côté service, il ne la supprime pas côté session.
+====
+
+=== Boucle : voilà, concrètement, l'absorption
+
+On peut maintenant relire le NOTE *« absorbeur de briques »* et voir *comment* chaque brique est repliée :
+
+[cols="1,2"]
+|===
+| Brique externe | Absorbée par
+
+| MetalLB — allocation de VIP
+| **LB-IPAM** (`CiliumLoadBalancerIPPool`)
+
+| MetalLB — annonce (L2 ou BGP)
+| **L2 announcement** *ou* **BGP Control Plane**
+
+| keepalived/HAProxy — failover de VIP
+| **élection de leader L2** (`Lease`) + gratuitous ARP au basculement
+
+| HAProxy — répartition vers les backends
+| le **datapath eBPF** déjà décrit (`cilium_lb4_*`, `from-netdev`, `redirect_peer`)
+|===
+
+La VIP externe n'est, au fond, qu'une **nouvelle entrée de service** dans les mêmes maps `cilium_lb4_*` — pas une brique de plus. L'exposition nord-sud rejoint le datapath est-ouest au premier DNAT ; tout le reste du chemin, on l'a déjà parcouru phases 0 à 6.
+
+=== Débogage
+
+[source,bash]
+----
+kubectl get ciliumloadbalancerippool                 # les pools d'IP externes
+kubectl get svc -o wide                               # .status.loadBalancer.ingress rempli ?
+kubectl get ciliuml2announcementpolicy               # qui annonce quoi en L2
+kubectl get lease -n kube-system | grep l2announce    # l'élection de leader par VIP
+cilium-dbg bpf lb list                                # services -> backends, VIP LoadBalancer incluses
+# variante BGP :
+cilium bgp peers                                      # état des sessions BGP
+cilium bgp routes advertised ipv4 unicast            # les /32 annoncés par ce nœud
+----
+
+Là où la fiche réseau répondait « qui détient ce préfixe » avec la RIB BGP et `ip route`, le cluster Cilium répond « qui annonce cette VIP » avec `cilium bgp routes` (mode BGP) ou le `Lease` d'élection (mode L2) — la vérité a déménagé, comme toujours, du kernel générique vers le plan de contrôle de l'agent.
+
+== Hubble : l'observabilité du datapath
+
+Hubble n'est pas un outil d'observabilité *ajouté à* Cilium — c'est l'exposition structurée des événements que le datapath émet déjà. La carte de visibilité du flux ci-dessus disait : « `cilium monitor` écoute les événements émis par les programmes eux-mêmes (trace, drop, verdict de policy) ». Hubble, c'est **la même source d'événements**, enrichie, bufferisée et servie en API.
+
+Quand `from-container` décide un drop de policy, il émet un événement dans un ring buffer perf. `cilium monitor` le montre brut (IPs, identités numériques). Hubble le décore avec ce que l'agent sait de Kubernetes — noms de pods, namespaces, labels, nom du service — et le transforme en un objet `Flow` interrogeable. **Zéro instrumentation supplémentaire sur le chemin du paquet** : le coût d'émission est déjà payé par le datapath.
+
+=== Architecture
+
+[cols="1,3"]
+|===
+| Composant | Rôle
+
+| **Serveur Hubble**
+| Embarqué dans chaque `cilium-agent`. Lit les événements du ring buffer BPF du nœud, les enrichit, les garde dans un **buffer circulaire en mémoire** (taille fixe, quelques milliers de flows par nœud). Exposé en gRPC sur socket Unix local, optionnellement en TCP (port 4244).
+
+| **Hubble Relay**
+| L'agrégateur cluster-wide : se connecte aux serveurs de tous les nœuds et expose un point d'entrée unique (port 4245). C'est lui qui permet de poser une question à l'échelle du cluster au lieu de nœud par nœud.
+
+| **CLI** (`hubble observe`, `hubble status`)
+| Parle au relay (vue cluster) ou au serveur local (vue nœud).
+
+| **UI**
+| Dessine la service map par namespace à partir des mêmes flows.
+
+| **Métriques Prometheus**
+| Agrégats calculés à partir des flows : drops, verdicts, DNS, HTTP... Activables à la carte.
+
+| **Exporter**
+| Flow logs vers fichiers (JSON), pour reprise par une stack de logs.
+|===
+
+=== Le modèle de données : le Flow
+
+Un `Flow` porte :
+
+* le **verdict** (`FORWARDED`, `DROPPED`, `AUDIT`) avec la *raison* du drop (policy denied, CT invalid, unroutable...) ;
+* les deux extrémités **résolues en termes Kubernetes** : pod, namespace, labels, identité ;
+* le **L4** : protocole, ports, flags TCP ;
+* le **point de trace** — directement lisible avec le flux ci-dessus : `to-endpoint`, `from-endpoint`, `to-overlay`, `from-network`... ce sont les programmes du tableau « qui pilote quoi » qui signent l'événement. Un flow dit donc non seulement *que* A a parlé à C, mais *à quelle étape du flux* l'événement a été observé ou tué ;
+* en **L7**, si le trafic passe par le proxy Envoy : méthode/path/code HTTP, requêtes DNS, appels gRPC.
+
+=== Trois limites à connaître (elles structurent toute la configuration)
+
+. **Des événements, pas des paquets.** Hubble voit des métadonnées de flux, jamais les payloads. Ce n'est pas un tcpdump distribué — choix assumé (coût, confidentialité).
+. **Mémoire vive, pas d'historique.** Le ring buffer par nœud est circulaire et volatile : `hubble observe` montre le passé récent et le temps réel. Toute rétention passe par les métriques (agrégats Prometheus) ou l'exporter (flow logs fichiers).
+. **Le L7 est opt-in par flux.** Sans policy L7 ou annotation de visibilité qui route le trafic vers le proxy Envoy, on a le L3/L4 + les verdicts, pas le détail HTTP. La visibilité DNS suit la même règle (elle suppose que les résolutions passent par le proxy DNS de Cilium).
+
+=== Raccord avec la carte de visibilité
+
+La carte de visibilité du flux établissait que tcpdump est aveugle sur les segments enjambés par `ctx_redirect`/`redirect_peer`, et que `cilium monitor` voit précisément ces segments. Hubble est la version industrialisée de cette seconde colonne : les segments invisibles à tcpdump, rendus visibles, nommés en vocabulaire Kubernetes, et interrogeables à l'échelle du cluster. Là où la maquette de répondait « qui parle à qui » avec `ip neigh` et la FDB, le cluster Cilium y répond avec `hubble observe`.
+
+== En résumé
+
+[appendix]
+== Annexe : les manifests concrets (VIP d'ingest otel)
+
+La section _Exposition nord-sud_ dit **comment** ça marche ; cette annexe donne les **objets exacts** qu'on déploie pour une VIP d'ingest (le cas `otel-gateway`), champ par champ — la référence pour reproduire et auditer. Ils vivent en **GitOps** (Fleet, bundle `fleet/adm-only/otel-gateway/`), et une seule valeur — `ingestIP` — est templatée par cluster (adm-prd → `10.33.18.249`, adms-prd → `10.36.9.252`), injectée **à la fois** dans le bloc du pool et dans l'annotation du Service.
+
+NOTE: Cilium récent a promu ces CRD de `cilium.io/v2alpha1` (exemples de la section théorique) à **`cilium.io/v2`** (ce que servent nos clusters). Le contenu des champs est identique.
+
+=== Le jeu complet
+
+[cols="1,1,2"]
+|===
+| Objet | Type | Rôle
+
+| `otel-vip` | `CiliumLoadBalancerIPPool` | réserve la VIP otel à un seul Service (via label)
+| `ingress-vip` | `CiliumLoadBalancerIPPool` | pool générique (Traefik) — posé au bootstrap
+| `ingress-l2` | `CiliumL2AnnouncementPolicy` | annonce ARP de **toutes** les VIP LB — posé au bootstrap
+| `otel-gateway-lb` | `Service type: LoadBalancer` | demande l'IP + route vers les pods (entrée **externe**)
+| `otel-gateway` | `Service` (ClusterIP) | entrée **interne** (agents du cluster, via DNS)
+|===
+
+Trois familles suffisent : **un pool** (quelle IP), **un Service** (je la demande + je route), **une policy L2** (qui l'annonce). Rien d'autre — pas de MetalLB, pas de keepalived (cf. tableau d'absorption).
+
+=== `CiliumLoadBalancerIPPool` — réserver une VIP à un seul service
+
+[source,yaml]
+----
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: otel-vip
+spec:
+  blocks:
+    - cidr: 10.33.18.249/32           # <1>
+  serviceSelector:                    # <2>
+    matchLabels:
+      lbipam.tessi.fr/pool: otel-vip
+----
+<1> `blocks` accepte soit `cidr:`, soit une paire `start:`/`stop:` (comme le pool ingress de la section théorique). Ici un `/32` : **une seule IP**, la VIP dédiée.
+<2> `serviceSelector` **restreint** le pool aux Services portant ce label. Sans lui, n'importe quel Service `LoadBalancer` pourrait piocher `.249`. C'est le mécanisme qui **réserve** une VIP à un usage — et, symétriquement, empêche l'otel de voler la VIP d'ingress.
+
+[cols="1,3"]
+|===
+| Champ | Sens
+
+| `spec.blocks[].cidr` | le(s) bloc(s) allouable(s) ; `/32` = IP unique
+| `spec.blocks[].start/stop` | forme plage (ex. `.200`→`.250`) pour un pool large
+| `spec.serviceSelector` | limite le pool aux Services labellisés ; vide = tout Service
+| `spec.disabled` | `true` gèle les allocations sans supprimer le pool
+|===
+
+=== Le `Service type: LoadBalancer` — demander l'IP et router
+
+[source,yaml]
+----
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-gateway-lb
+  namespace: observability
+  labels:
+    lbipam.tessi.fr/pool: otel-vip          # <1>
+  annotations:
+    lbipam.cilium.io/ips: "10.33.18.249"    # <2>
+    # lbipam.cilium.io/sharing-key: "..."   # <3>
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster            # <4>
+  selector:                                 # <5>
+    app: opentelemetry
+    component: otel-gateway
+  ports:
+    - { name: otlp, port: 4317, targetPort: 4317, protocol: TCP }
+----
+<1> Le label qui **matche le `serviceSelector` du pool** → LB-IPAM sait dans quel pool piocher.
+<2> `lbipam.cilium.io/ips` **exige une IP précise** (au lieu de laisser Cilium choisir dans le pool). Accepte une liste séparée par virgule. C'est ce qui rend la VIP **stable et prévisible** — les clients downstream la codent en dur.
+<3> `lbipam.cilium.io/sharing-key` : deux Services de **même clé** partagent **une seule IP** (sur des ports distincts) — pour co-loger plusieurs protocoles sur un VIP. Vide ici : VIP dédiée, pas de partage.
+<4> `externalTrafficPolicy: Cluster` — choix **délibéré** pour une VIP d'ingest à clients **externes**. Avec `Local` + annonce L2, si le lease de la VIP tombe sur un nœud **sans** pod otel-gateway, le trafic externe est **RST**. `Cluster` route vers n'importe quel pod depuis n'importe quel nœud. La perte d'IP source (SNAT) est **sans impact** ici : en cross-cluster l'IP source est déjà celle du nœud émetteur, et l'identité du cluster vit dans les _resource attributes_ de la télémétrie, pas dans l'IP. (Pour un **ingress**, à l'inverse, le pattern DaemonSet + `Local` de la section théorique reste préférable.)
+<5> `selector` relie la VIP aux **pods** backend ; ils deviennent les endpoints vers lesquels l'étage 2 (datapath eBPF) équilibre.
+
+NOTE: le bundle pose **deux** Services sur les mêmes pods : le `-lb` (LoadBalancer, entrée externe) et un `otel-gateway` **ClusterIP** (entrée interne, consommé par les agents du cluster via `otel-gateway.observability.svc`). Même backend, deux portes.
+
+=== `externalTrafficPolicy` vs `internalTrafficPolicy` — deux portes, deux politiques
+
+Le champ `externalTrafficPolicy` (callout <4>) a un jumeau qu'il ne faut pas confondre : `internalTrafficPolicy`. **Ce ne sont pas deux noms pour le même réglage** — ils gouvernent deux **classes de trafic** distinctes, selon la **porte d'entrée** du Service. Le nom encode l'**origine** du flux, pas « où on route ensuite ».
+
+[cols="1,2,1,1"]
+|===
+| Champ | Trafic entrant **par** | `Cluster` (défaut) | `Local`
+
+| `externalTrafficPolicy`
+| NodePort, **LoadBalancer**, externalIPs (clients **externes**)
+| tout endpoint du cluster (SNAT, peut sauter de nœud)
+| endpoints **locaux au nœud** ; **préserve l'IP source client** ; RST si aucun pod local
+
+| `internalTrafficPolicy`
+| **ClusterIP** (clients **internes** : pods/nœuds)
+| tout endpoint
+| endpoints locaux au nœud ; pas de hop inter-nœud
+|===
+
+Les deux posent la **même** question de second saut (`Cluster` = équilibrer partout / `Local` = rester local au nœud), mais **par porte** : un même Service peut vouloir `Local` en externe (préserver l'IP client d'un ingress) **et** `Cluster` en interne. D'où **deux champs**, et non un « internal » qui entrerait en collision avec le champ existant.
+
+Historiquement `externalTrafficPolicy` est né pour l'**ingress** (préservation d'IP source + éviter le hop) ; `internalTrafficPolicy` est arrivé après pour le **node-local** est-ouest (ex. node-local DNS). Dans ce bundle : `otel-gateway-lb` (LoadBalancer, clients externes) est gouverné par `externalTrafficPolicy` — le bon champ, exactement ; le Service interne `otel-gateway` (ClusterIP) le serait par `internalTrafficPolicy` (laissé au défaut `Cluster`).
+
+=== `CiliumL2AnnouncementPolicy` — qui annonce, depuis quels nœuds
+
+[source,yaml]
+----
+apiVersion: cilium.io/v2
+kind: CiliumL2AnnouncementPolicy
+metadata:
+  name: ingress-l2
+spec:
+  serviceSelector: {}       # <1>
+  nodeSelector: {}          # <2>
+  loadBalancerIPs: true     # <3>
+  # externalIPs: false
+  # interfaces: ["^eth0$"]  # <4>
+----
+<1> `serviceSelector` vide = annonce les VIP de **tous** les Services LB (donc `.249` **et** `.251`). Une seule policy large suffit ; c'est pourquoi ajouter le pool `otel-vip` n'a demandé **aucune** modif de la policy L2.
+<2> `nodeSelector` vide = **tout nœud** peut être élu leader d'une VIP (masters **inclus**). ⚠️ Pour un cluster propre, le **restreindre aux workers** évite qu'un master porte du trafic nord-sud.
+<3> `loadBalancerIPs: true` = annonce les IP de `type: LoadBalancer`. `externalIPs: true` ferait de même pour `Service.spec.externalIPs`.
+<4> `interfaces` = regex sur les NIC hôtes où répondre à l'ARP (vide = toutes). À fixer si les nœuds ont plusieurs interfaces et qu'on ne veut annoncer que sur le segment client.
+
+[cols="1,3"]
+|===
+| Champ | Sens
+
+| `serviceSelector` | quels Services voient leur VIP annoncée (vide = tous)
+| `nodeSelector` | quels nœuds éligibles à l'élection de leader (vide = tous)
+| `loadBalancerIPs` | annoncer les IP LoadBalancer
+| `externalIPs` | annoncer les `spec.externalIPs`
+| `interfaces` | regex des NIC où répondre à l'ARP (vide = toutes)
+|===
+
+=== Segmenter : une policy par famille de VIP
+
+Une policy large (`serviceSelector` vide) annonce **toutes** les VIP depuis **tous** les nœuds — simple mais grossier. Pour router finement, **une policy par famille**, chacune scopée par `serviceSelector` (quelles VIP), `nodeSelector` (quels nœuds portent le lease) et `interfaces` (quelle NIC). Règle : **`serviceSelector` disjoints** → chaque VIP gouvernée par exactement une policy.
+
+[source,yaml]
+----
+# ingress : lease depuis les workers, NIC front
+kind: CiliumL2AnnouncementPolicy
+metadata: { name: l2-ingress }
+spec:
+  serviceSelector: { matchLabels: { lbipam.tessi.fr/pool: ingress-vip } }
+  nodeSelector:
+    matchExpressions:
+      - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+  interfaces: ["^eth0$"]
+  loadBalancerIPs: true
+---
+# otel : lease depuis les nœuds telemetry, autre NIC
+kind: CiliumL2AnnouncementPolicy
+metadata: { name: l2-otel }
+spec:
+  serviceSelector: { matchLabels: { lbipam.tessi.fr/pool: otel-vip } }
+  nodeSelector: { matchLabels: { role.tessi.fr/telemetry: "true" } }
+  interfaces: ["^eth1$"]
+  loadBalancerIPs: true
+----
+
+La chaîne en une phrase : **le pool alloue l'IP** (scopé par label), **le Service la demande et route vers ses pods**, **la policy l'annonce en L2** — en choisissant quelles VIP (`serviceSelector`) et quels nœuds se partagent le lease (`nodeSelector`).
+
+=== Placement : bootstrap (RKE2/Ansible) vs GitOps
+
+Où doivent vivre ces objets ? Pas « tout au même endroit », mais **par couche** — à cause d'une dépendance circulaire.
+
+[cols="1,2"]
+|===
+| Couche | Ce qui y appartient
+
+| **Bootstrap** (config RKE2 / `additionalManifest`, posé par Ansible avec le CNI)
+| le **strict minimum de joignabilité** : Cilium, la `CiliumL2AnnouncementPolicy` large, et le **pool d'ingress** — car le cluster doit être atteignable (Rancher/ArgoCD/Fleet passent **par** cette VIP d'ingress) **avant** que le GitOps prenne la main.
+
+| **GitOps** (`k8s-admin`, Fleet)
+| tout le **spécifique applicatif** : les pools dédiés (`otel-vip`) et leurs Services. Versionné avec l'app, revu en PR, drift détecté.
+|===
+
+La tentation de **tout ramener en GitOps** bute sur l'œuf-et-la-poule : la policy L2 et le pool d'ingress rendent joignable l'ingress… par lequel ArgoCD/Fleet sont eux-mêmes servis. Les sortir du bootstrap, c'est risquer un cluster fraîchement provisionné **injoignable** tant que le premier sync GitOps n'a pas tourné — sync qui a besoin de l'ingress pour être piloté.
+
+**Recommandation.** Garder au bootstrap **uniquement** le socle de joignabilité (CNI + policy L2 + pool d'ingress), idéalement via les **values Helm de Cilium** (déclaratif, versionné) plutôt qu'un `additionalManifest` opaque ; **déplacer en GitOps** tout ce qui est applicatif — ce qui est **déjà** le cas de la VIP otel. Et restreindre le `nodeSelector` de la policy L2 aux workers. Frontière nette : le bootstrap fabrique un cluster _joignable et vide_, le GitOps y pose _tout le reste_.
+
+Ce que Cilium change ne se résume pas à « plus rapide qu'iptables ». Le flux ci-dessus montre un renversement : partout où le réseau classique découvre (ARP, FDB, flood) ou consulte des structures génériques auto-alimentées (FIB, conntrack, règles DNAT), Cilium sait d'avance — des maps dédiées, écrites par l'agent depuis l'état Kubernetes, lues par des programmes aux quatre points d'ancrage du kernel. Les interfaces ne sont plus reliées par le bas (aucun L2 partagé) mais par le haut (le plan de contrôle qui écrit les maps) ; le service meurt dans le syscall, l'identité remplace l'IP, et la vérité opérationnelle déménage de ip route/iptables vers les maps — Hubble n'étant que cette vérité rendue interrogeable.

@@ -1,0 +1,303 @@
+.exemples .gitignore (commenté ligne par ligne)
+[source,conf]
+----
+----------------------------
+Ignorer des fichiers généraux
+----------------------------
+
+*.log # Tous les fichiers .log
+*.tmp # Tous les fichiers temporaires .tmp
+*.bak # Fichiers de sauvegarde .bak
+*.old # Anciennes versions .old
+*.orig # Fichiers laissés par des merges .orig
+*~ # Backups (ex: éditeurs)
+*.swp # Fichiers swap Vim
+*.swo # Autres variantes swap Vim
+*.swn # Idem
+.tmp. # Fichiers temporaires nommés avec suffixe
+*.lock # Fichiers de lock génériques
+!README.lock # …mais on ré-include un fichier précis si voulu
+
+----------------------------
+Système d'exploitation
+----------------------------
+
+.DS_Store # macOS – métadonnées Finder
+.AppleDouble # macOS – ressources Apple
+.LSOverride # macOS – override locale
+Icon? # macOS – icône personnalisée (Icon\r)
+._* # macOS – fichiers de ressources
+Thumbs.db # Windows – vignettes
+ehthumbs.db # Windows – vignettes étendues
+Desktop.ini # Windows – config dossiers
+$RECYCLE.BIN/ # Windows – corbeille
+.fseventsd # macOS – journal FS events
+.Spotlight-V100 # macOS – index Spotlight
+.Trashes # macOS – corbeille volumes
+.nfs* # Linux – fichiers NFS temporaires
+
+----------------------------
+Archives & paquets
+----------------------------
+
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.rar
+*.7z
+*.xz
+*.deb
+*.rpm
+
+----------------------------
+Logs courants d’outils JS
+----------------------------
+
+npm-debug.log* # npm
+yarn-debug.log* # yarn
+yarn-error.log* # yarn
+pnpm-debug.log* # pnpm
+
+----------------------------
+Environnements & secrets
+----------------------------
+
+.env # Variables d’environnement (attention: sécurité)
+.env.* # Variantes (.env.development, etc.)
+.env.local # Fichiers .env locaux
+.envrc # direnv
+.direnv/ # Dossier direnv
+*.key # Clés privées (à gérer hors repo)
+*.pem # Certificats/clefs (privilégier un coffre)
+
+----------------------------
+Éditeurs & IDE
+----------------------------
+
+.vscode/ # VS Code (entier)
+!.vscode/extensions.json # …sauf recommendations d’extensions
+!.vscode/settings.json # …et paramètres projet utiles
+.idea/ # JetBrains (IntelliJ, PyCharm, etc.)
+*.iml # Fichiers module IntelliJ
+*.sublime-workspace # Sublime Text
+*.sublime-project # Sublime Text
+*.code-workspace # VS Code workspaces
+.vim/ # Config de projet Vim
+.viminfo # Cache Vim
+.kate-swp # Kate swap
+.emacs.d/auto-save-list/ # Emacs autosave
+## # Emacs backups (#…#)
+.# # Emacs lockfiles
+
+----------------------------
+Node.js / Front-end
+----------------------------
+
+node_modules/ # Dépendances npm/yarn/pnpm
+.pnpm-store/ # Cache pnpm
+.npm/ # Cache npm
+.bower_components/ # Bower (legacy)
+.cache/ # Caches divers (Babel, ESLint, etc.)
+.next/ # Next.js build
+.nuxt/ # Nuxt build
+out/ # Next.js export statique
+dist/ # Dossier de build générique
+build/ # Dossier de build générique
+coverage/ # Rapports de couverture
+storybook-static/ # Storybook build
+.svelte-kit/ # SvelteKit
+.angular/ # Angular cache
+.eslintcache # Cache ESLint
+
+----------------------------
+Python
+----------------------------
+
+pycache/ # Bytecode compilé
+*.py[cod] # .pyc/.pyo/.pyd
+*.so # Extensions C compilées
+.venv/ # Environnement virtuel
+venv/ # Autres conventions venv
+env/ # Autres conventions venv
+pip-wheel-metadata/ # Metadata wheel
+build/ # Dossiers build
+dist/ # Paquets distribuables
+.eggs/ # egg
+*.egg-info/ # Metadata egg-info
+.mypy_cache/ # Cache mypy
+.pytest_cache/ # Cache pytest
+.coverage # Couverture
+htmlcov/ # Rapports HTML coverage
+.ipynb_checkpoints/ # Jupyter
+.pyre/ # Pyre type checker
+.pytype/ # pytype
+
+----------------------------
+Java / JVM / Kotlin / Scala
+----------------------------
+
+*.class # Bytecode Java
+*.jar # Archives Java
+.war # Web archives
+.ear # Enterprise archives
+hs_err_pid # Crash logs JVM
+replay_pid # Flight Recorder
+target/ # Maven build
+.gradle/ # Gradle cache
+build/ # Gradle build
+!gradle/wrapper/gradle-wrapper.jar # Conserver le wrapper Gradle
+
+----------------------------
+Go
+----------------------------
+
+bin/ # Binaires locaux
+*.test # Fichiers de test/binaire go test -c
+coverage.out # Couverture Go
+vendor/ # (si vous ne committez pas vendor)
+
+----------------------------
+Rust
+----------------------------
+
+target/ # Build Rust
+**/*.rs.bk # Backups Rustfmt
+
+Cargo.lock : garder en app (binaires), ignorer parfois en libs
+!Cargo.lock # (décommentez si vous tenez à forcer l’inclusion)
+----------------------------
+Ruby / Rails
+----------------------------
+
+.bundle/ # Bundler
+vendor/bundle/ # Gems vendorisées
+log/ # Logs Rails
+tmp/ # Temp Rails
+coverage/ # Couverture
+.byebug_history # Debug
+*.rbc # Bytecode Ruby
+.sass-cache/ # Cache SASS
+
+----------------------------
+PHP / Composer / Symfony / Laravel
+----------------------------
+
+vendor/ # Dépendances Composer
+composer.phar # Binaire composer
+var/cache/ # Cache Symfony
+var/log/ # Logs Symfony
+storage/ # Storage Laravel
+bootstrap/cache/ # Cache Laravel
+.idea/ # IDE
+.phpunit.result.cache # Cache PHPUnit
+
+----------------------------
+.NET / C# / F#
+----------------------------
+
+bin/ # Binaires
+obj/ # Objets
+*.user # Fichiers utilisateur
+*.suo # User options (legacy)
+*.userosscache # Cache OSS
+*.sln.docstates # État solution
+.nupkg # Packages NuGet
+packages/ # NuGet packages (si non restaurés)
+TestResult/ # Résultats tests
+
+----------------------------
+Swift / iOS / Xcode
+----------------------------
+
+DerivedData/ # Cache Xcode
+build/ # Build
+*.xcuserdatad # Données utilisateur
+*.xcuserstate # État utilisateur
+*.xcscmblueprint # Metadata SCM
+*.xccheckout # Checkout metadata
+*.moved-aside # Fichiers déplacés Xcode
+*.xcodeproj/project.xcworkspace/xcuserdata/ # Données perso
+
+----------------------------
+Android / Gradle
+----------------------------
+
+*.iml # Intellij module
+.gradle/ # Cache Gradle
+/local.properties # Chemins locaux SDK
+/.idea/ # Config IDE
+/captures/ # Captures
+outputs/ # Artifacts build
+*.apk # APK
+*.aab # App Bundle
+
+----------------------------
+Docker / Conteneurs
+----------------------------
+
+.docker/ # Config docker locale
+*.pid # PID files
+*.pid.lock # Locks
+docker-compose.override.yml # Overrides locaux
+.env.docker # Env docker local
+
+----------------------------
+Terraform / IaC
+----------------------------
+
+*.tfstate # State Terraform
+.tfstate. # Versions state
+.terraform/ # Cache Terraform
+crash.log # Crash Terraform
+override.tf # Overrides locaux
+override.tf.json # Overrides locaux
+*_override.tf # Overrides pattern
+*_override.tf.json # Overrides pattern
+!.terraform.lock.hcl # Conserver le lock (recommandé)
+
+----------------------------
+Kubernetes (local)
+----------------------------
+
+.kube/ # Kubeconfig local (ne pas commit d’habitude)
+helm-chart/.chartignore # (fichier propre à Helm, laisser dans le chart)
+
+----------------------------
+Monorepo / multiproj
+----------------------------
+
+**/node_modules/ # Ignorer node_modules partout
+packages//dist/ # Ignorer dist dans chaque package
+apps//build/ # Build d’apps
+**/.cache/ # Caches multiples
+**/coverage/ # Couvertures multiples
+
+----------------------------
+Ancrages, négations & globs avancés
+----------------------------
+
+/build/ # Ignore uniquement build à la racine du repo
+build/ # Ignore build à tous les niveaux
+docs/.html # HTML directement sous docs/ (pas sous-dossiers)
+docs/**/.html # Tous les HTML sous docs/ récursivement
+temp/**/cache/ # Tout cache/ situé n'importe où sous temp/
+#not-a-comment.txt # Fichier commençant par # (échappé)
+my\ file.txt # Fichier avec espace (échappé)
+!.gitignore # S’assurer que le .gitignore est traqué
+!.gitattributes # Idem pour .gitattributes
+!.gitmodules # Idem pour .gitmodules
+!.github/ # Conserver workflows & templates GitHub
+
+Astuce : pour ré-inclure un fichier dans un dossier ignoré,
+il faut aussi ré-inclure ses dossiers parents si ceux-ci sont ignorés.
+----------------------------
+Modèles "tout ignorer sauf…"
+----------------------------
+* # (Exemple) Ignorer tout par défaut
+!src/ # …sauf le dossier src
+!src/**/*.go # …et les .go sous src
+!.gitignore # …et ce fichier
+(Attention: modèle radical, à manipuler avec précaution)
+----

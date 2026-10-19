@@ -1,0 +1,445 @@
+= Loi Beta
+:toc:
+:toclevels: 3
+:sectnums:
+
+== Introduction — du discret au continu
+
+Jusqu’ici, nous avons étudié des variables aléatoires discrètes :
+
+* Bernoulli : X ∈ {0,1}
+* Binomiale : S ∈ {0,1,…,n}
+
+Dans ces cas, une loi de probabilité est définie par :
+
+----
+P(X = x)
+----
+
+Lorsque la variable aléatoire est continue (par exemple une probabilité),
+la probabilité d’une valeur exacte est nulle :
+
+----
+P(P = p) = 0
+----
+
+Il est donc nécessaire d’introduire la notion de *densité de probabilité*.
+
+---
+
+== Variables aléatoires continues et densité de probabilité
+
+=== Définition
+
+Soit X une variable aléatoire continue.
+On appelle *densité de probabilité* une fonction f telle que :
+
+* f(x) ≥ 0
+* ∫ f(x) dx = 1
+
+et telle que, pour tout intervalle [a,b] :
+
+----
+P(a ≤ X ≤ b) = ∫ₐᵇ f(x) dx
+----
+
+La probabilité est donc une *aire sous la courbe* de la densité, de hauteur f(x) et de largeur dx.
+
+=== Espérance (cas continu)
+
+Pour une variable aléatoire continue X de densité f :
+
+----
+E[X] = ∫ x f(x) dx
+----
+
+Cette définition est l’analogue continu de la somme discrète.
+
+== Changement de point de vue bayésien
+
+Dans les modèles précédents :
+
+* X ~ Bernoulli(p)
+* S ~ Binomiale(n,p)
+
+le paramètre p est fixé mais inconnu.
+
+Dans une approche bayésienne :
+
+* p devient une variable aléatoire
+* on modélise notre incertitude sur p
+
+La loi Beta est la loi naturelle pour modéliser une probabilité inconnue.
+
+== Définition de la loi Beta
+
+On dit qu’une variable aléatoire P suit une loi Beta de paramètres α et β :
+
+----
+P ~ Beta(α, β)
+----
+
+avec :
+
+* α > 0
+* β > 0
+* P ∈ [0,1]
+
+== Construction de la densité Beta
+
+On propose la forme candidate :
+
+----
+g(p) = p^(α − 1)(1 − p)^(β − 1),   p ∈ (0,1)
+----
+
+Cette forme est positive pour α,β > 0 et reflète :
+
+* le comportement près de 0 (via α)
+* le comportement près de 1 (via β)
+
+Elle n’est pas encore une densité car elle n’est pas normalisée.
+
+---
+
+== Fonction Beta (normalisation)
+
+On définit la *fonction Beta* :
+
+----
+B(α, β) = ∫₀¹ t^(α − 1)(1 − t)^(β − 1) dt
+----
+
+Cette intégrale est finie si et seulement si α > 0 et β > 0.
+
+On définit alors la densité de la loi Beta :
+
+----
+f(p) = (1 / B(α, β)) · p^(α − 1)(1 − p)^(β − 1)
+----
+
+On a bien :
+
+----
+∫₀¹ f(p) dp = 1
+----
+
+---
+
+== Fonction Gamma
+
+=== Définition
+
+Pour x > 0, la fonction Gamma est définie par :
+
+----
+Γ(x) = ∫₀^∞ t^(x − 1) e^(−t) dt
+----
+
+Propriétés importantes :
+
+* Γ(x + 1) = x Γ(x)
+* Γ(n) = (n − 1)! pour n ∈ ℕ*
+
+---
+
+== Relation entre Beta et Gamma
+
+=== Théorème
+
+Pour α > 0 et β > 0 :
+
+----
+B(α, β) = Γ(α)Γ(β) / Γ(α + β)
+----
+
+---
+
+=== Démonstration
+
+On écrit :
+
+----
+Γ(α)Γ(β)
+= ∫₀^∞ ∫₀^∞ u^(α − 1) v^(β − 1) e^(−(u+v)) du dv
+----
+
+On effectue le changement de variables :
+
+----
+t = u + v
+x = u / (u + v)
+----
+
+avec :
+
+----
+u = tx
+v = t(1 − x)
+----
+
+Le jacobien vaut :
+
+----
+|J| = t
+----
+
+On obtient :
+
+----
+Γ(α)Γ(β)
+= ∫₀¹ x^(α − 1)(1 − x)^(β − 1) dx
+  · ∫₀^∞ t^(α + β − 1) e^(−t) dt
+----
+
+Soit :
+
+----
+Γ(α)Γ(β) = B(α, β) Γ(α + β)
+----
+
+d’où :
+
+----
+B(α, β) = Γ(α)Γ(β) / Γ(α + β)
+----
+
+---
+
+== Espérance de la loi Beta
+
+Par définition :
+
+----
+E[P] = ∫₀¹ p f(p) dp
+----
+
+En remplaçant f(p) :
+
+----
+E[P] = (1 / B(α, β)) ∫₀¹ p^α (1 − p)^(β − 1) dp
+----
+
+On reconnaît :
+
+----
+∫₀¹ p^α (1 − p)^(β − 1) dp = B(α + 1, β)
+----
+
+Donc :
+
+----
+E[P] = B(α + 1, β) / B(α, β)
+----
+
+En utilisant Gamma :
+
+----
+E[P] = α / (α + β)
+----
+
+---
+
+== Variance de la loi Beta
+
+On utilise :
+
+----
+Var(P) = E[P²] − (E[P])²
+----
+
+Calcul de E[P²] :
+
+----
+E[P²]
+= (1 / B(α, β)) ∫₀¹ p^(α + 1)(1 − p)^(β − 1) dp
+= B(α + 2, β) / B(α, β)
+----
+
+Simplification :
+
+----
+E[P²] = α(α + 1) / ((α + β)(α + β + 1))
+----
+
+On obtient finalement :
+
+----
+Var(P) = αβ / ((α + β)² (α + β + 1))
+----
+
+---
+
+== Interprétation des paramètres
+
+* α − 1 : succès a priori
+* β − 1 : échecs a priori
+* α + β : force de la croyance (taille d’échantillon effective)
+
+---
+
+== Conjugaison Beta–Binomiale
+
+Si :
+
+* P ~ Beta(α, β)
+* S | P ~ Binomiale(n, P)
+* on observe k succès
+
+Alors :
+
+----
+P | données ~ Beta(α + k, β + n − k)
+----
+
+La mise à jour est additive et analytique.
+
+---
+
+== Conclusion générale
+
+À ce stade :
+
+* Bernoulli / Binomiale modélisent les observations
+* Beta modélise l’incertitude sur la probabilité
+* la densité assure le passage au continu
+* Gamma permet la normalisation analytique
+* l’espérance et la variance sont calculables explicitement
+
+Le cadre probabiliste bayésien est maintenant complet.
+
+== Synthèse — Loi Beta (résumé opérationnel)
+
+=== Définition
+
+Une variable aléatoire P suit une loi Beta de paramètres α et β, notée :
+
+----
+P ~ Beta(α, β)
+----
+
+avec :
+
+* α > 0
+* β > 0
+* P ∈ [0,1]
+
+La loi Beta est une loi continue définie sur l’intervalle [0,1],
+utilisée pour modéliser une incertitude sur une probabilité.
+
+---
+
+=== Densité de probabilité
+
+La densité de la loi Beta est donnée par :
+
+----
+f(p) = (1 / B(α, β)) · p^(α − 1)(1 − p)^(β − 1),
+p ∈ [0,1]
+----
+
+où la fonction Beta est définie par :
+
+----
+B(α, β) = ∫₀¹ t^(α − 1)(1 − t)^(β − 1) dt
+----
+
+---
+
+=== Expression via la fonction Gamma
+
+La fonction Beta s’exprime à l’aide de la fonction Gamma :
+
+----
+B(α, β) = Γ(α)Γ(β) / Γ(α + β)
+----
+
+La densité peut donc aussi s’écrire :
+
+----
+f(p) = Γ(α + β) / (Γ(α)Γ(β)) · p^(α − 1)(1 − p)^(β − 1)
+----
+
+---
+
+=== Espérance
+
+L’espérance de la loi Beta est :
+
+----
+E[P] = α / (α + β)
+----
+
+Elle correspond à la valeur moyenne de la probabilité selon la croyance modélisée.
+
+---
+
+=== Variance
+
+La variance de la loi Beta est :
+
+----
+Var(P) = αβ / ((α + β)² (α + β + 1))
+----
+
+Elle mesure l’incertitude associée à la croyance sur la probabilité.
+
+---
+
+=== Interprétation des paramètres
+
+* α − 1 : nombre de succès a priori
+* β − 1 : nombre d’échecs a priori
+* α + β : force de la croyance (taille d’échantillon effective)
+
+Une grande valeur de α + β correspond à une croyance plus concentrée.
+
+---
+
+=== Cas particuliers remarquables
+
+* Beta(1,1) :
+----
+f(p) = 1
+----
+→ croyance uniforme (ignorance totale)
+
+* Beta(α,α) :
+→ distribution symétrique autour de 0.5
+
+* α >> β :
+→ croyance concentrée près de 1
+
+* β >> α :
+→ croyance concentrée près de 0
+
+---
+
+=== Lien avec Bernoulli et Binomiale
+
+* Bernoulli / Binomiale : modèles d’observation
+* Beta : modèle de croyance sur le paramètre p
+
+La loi Beta est conjuguée à la loi binomiale :
+
+----
+P ~ Beta(α, β)
+S | P ~ Binomiale(n, P)
+⇒ P | données ~ Beta(α + k, β + n − k)
+----
+
+La mise à jour bayésienne est additive et analytique.
+
+---
+
+=== Rôle dans le cadre bayésien
+
+La loi Beta permet de :
+
+* modéliser une incertitude sur une probabilité
+* intégrer une information a priori
+* mettre à jour cette croyance à partir des données
+* calculer des espérances et variances exploitables en décision
+
+Elle constitue une brique centrale de l’inférence bayésienne
+et le pont naturel entre statistiques et décision sous incertitude.

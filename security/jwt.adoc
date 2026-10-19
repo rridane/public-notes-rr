@@ -1,0 +1,622 @@
+:author-url: https://github.com/rridane
+:author: rridane
+:source-highlighter: rouge
+:hardbreaks:
+:table-caption!:
+:toc: left
+:toclevels: 3
+:numbered:
+
+= JWT (JSON Web Tokens) – Fiche ultra-complète
+
+== Définition
+
+Un **JWT** est un jeton **signé** (JWS) – ou, si besoin, **chiffré** (JWE) – permettant de transmettre des informations (*claims*) entre deux parties de manière compacte et sécurisée, tout en restant stateless côté serveur.
+
+**JWS** signifie **Json Web Signature** et **JWE** signifie **Json Web Encryption**
+
+.Structure
+----
+<HEADER>.<PAYLOAD>.<SIGNATURE>   (JWS)
+<HEADER>.<ENCRYPTED_KEY>.<IV>.<CIPHERTEXT>.<TAG>   (JWE)
+----
+
+Chaque partie est encodée en **Base64URL** pour éviter les caractères non URL-safe, autrement dit, dans la structure, il faut comprendre <PAYLOAD> par base64Url(JsonPayload).
+
+=== 🎯 Pourquoi Base64URL ?
+
+- Facilite la transmission du JWT dans des URLs, headers HTTP, cookies, etc.
+- Supprime les caractères `+`, `/`, `=` du Base64 standard
+- Ne compresse ni ne chiffre : tout reste visible
+
+== Structure détaillée
+
+=== Header
+
+Le header est le même (en structure), que l'on soit en JWS ou en JWE.
+
+[source,json]
+----
+{
+  "alg": "RS256",
+  "typ": "JWT",
+  "kid": "abc123"
+}
+----
+
+* `alg` : algorithme de signature (`HS256`, `RS256`, `ES256`, …) ou de chiffrement (`RSA-OAEP`, …)
+* `typ` : type du jeton – généralement `"JWT"`
+* `kid` : **Key ID** (Identifiant de la clé publique) optionnel, indispensable pour la rotation de clés
+
+=== Payload (claims)
+
+==== Structure de base
+
+C'est le "body" du JWT, il est présent tel quel en base64 dans le JWS, et inclue dans le CypherText en JWE.
+
+.Exemple exhaustif
+[source,json]
+----
+{
+  "iss": "https://auth.example.com",
+  "sub": "user_123456",
+  "aud": "api.example.com",
+  "exp": 1710000000,
+  "nbf": 1709990000,
+  "iat": 1709980000,
+  "jti": "abcd-1234-efgh-5678",
+  "scope": "read:users write:users",
+  "roles": ["admin", "user"],
+  "email": "john.doe@example.com",
+  "username": "johndoe",
+  "tenant_id": "tenant_abc",
+  "custom_claim": "custom_value"
+}
+----
+
+==== Claims standards
+
+.Tableau des *registered claims*
+[cols="1,1,2",options="header"]
+|===
+|Claim |Type |Description
+|`iss` |string |Issuer : émetteur du token
+|`sub` |string |Subject : identifiant du sujet
+|`aud` |string / array |Audience : destinataire prévu
+|`exp` |timestamp |Expiration : date d’expiration (obligatoire en prod)
+|`nbf` |timestamp |Not Before : valide à partir de
+|`iat` |timestamp |Issued At : date de création
+|`jti` |string |JWT ID : identifiant unique
+|===
+
+Autres claims fréquents : `scope`, `roles`, `email`, `tenant_id`, `custom_*`.
+
+Un jwt contient donc avant tout un header et un body (payload). Ce header et ce payload peuvent être transmis en clair, mais avec une garantie d'authenticité (JWS) ou en chiffré (JWE).
+
+== JWS vs JWE
+
+Les JWT peuvent être **signés (JWS)** ou **chiffrés (JWE)**, avec des objectifs, structures et algorithmes très différents.
+
+=== 🔏 JWS – Authenticité
+
+Objectif : **intégrité + authenticité** (mais pas de confidentialité)
+
+|===
+|               |Signature |Chiffrement |Payload lisible
+|**JWS**        |✅ Oui    |❌ Non      |✅ Oui
+|===
+
+* Ne protège **pas la confidentialité** → ne jamais y stocker de données sensibles en clair
+
+==== ✍️ Comprendre la Signature
+
+La signature d’un JWT avec JWS ne chiffre **aucune donnée** : elle vise uniquement à **garantir l'intégrité et l’authenticité** du message.
+Le contenu reste **entièrement lisible**, mais infalsifiable.
+
+==== Algorithmes de signature JWS
+
+[cols="1,1,2",options="header"]
+|===
+|Algorithme |Type |Usage
+|`HS256`, `HS384`, `HS512` |Symétrique (HMAC) |Clé partagée entre parties (simple mais risqué à grande échelle)
+|`RS256`, `RS384`, `RS512` |Asymétrique (RSA + SHA) |Clé privée pour signer, clé publique (JWKS) pour vérifier
+|`ES256`, `ES384`, `ES512` |Asymétrique (ECDSA) |Compact, rapide, sécurisé (basé sur courbes elliptiques)
+|`none` |⚠️ Aucun |⚠️ À proscrire : vulnérabilité historique
+|===
+
+*Recommandé :* `RS256` ou `ES256` avec rotation (`kid` + JWKS)
+
+==== 🔁 Étapes de la signature JWS (`RS256`)
+
+[source,text]
+----
+1. Encodage Base64URL :
+   encoded_header  = base64url(header JSON)
+   encoded_payload = base64url(payload JSON)
+
+2. Construction du message à signer :
+   message = encoded_header + "." + encoded_payload
+
+3. Hash du message :
+   hash = SHA-256(message)
+
+4. Signature RSA :
+   signature = RSA_sign(private_key, hash)
+
+5. Encodage final :
+   encoded_signature = base64url(signature)
+
+6. JWT final :
+   JWT = encoded_header + "." + encoded_payload + "." + encoded_signature
+----
+
+.Bonnes pratiques JWS
+* Vérifier **toujours** : signature, `exp`, `aud`, `iss`
+* Ne jamais accepter `alg: none`
+* Ajouter `jti` pour la révocation ponctuelle
+
+=== ✅ Vérification de la signature JWS pas à pas (RS256)
+
+[source,text]
+----
+# Décoder le JWT :
+JWT = <header_b64>.<payload_b64>.<signature_b64>
+
+Décoder Base64URL :
+header = base64url_decode(header_b64)
+payload = base64url_decode(payload_b64)
+signature = base64url_decode(signature_b64)
+
+Reconstituer le message signé :
+message = header_b64 + "." + payload_b64
+
+Calculer le hash :
+hash = SHA-256(message)
+
+Vérifier la signature RSA :
+is_valid = RSA_verify(public_key, hash, signature)
+----
+
+[source,code]
+----
+# Supposons que $JWS contienne le JWT complet
+# Note : la commande read utilise nativement IFS, raison pour laquelle elle décompose le jws
+
+IFS='.' read -r header_b64 payload_b64 signature_b64 <<< "$JWS"
+
+# Reconstituer le message signé
+message="${header_b64}.${payload_b64}"
+
+# Décoder la signature
+printf '%s' "$signature_b64" | base64 -d -A > sig.bin
+
+# Vérifier la signature avec la clé publique
+printf '%s' "$message" | openssl dgst -sha256 -verify public.pem -signature sig.bin
+----
+
+==== 🧠 Résumé
+
+- ✅ La signature porte sur le **hash du message encodé en Base64URL**
+- ❌ Le contenu n’est pas chiffré
+- ✅ Le destinataire peut vérifier la signature avec la **clé publique** ( à l'aide du **kid** si plusieurs clés publiques sont utilisées)
+- ❌ Ne protège pas la **confidentialité**, uniquement l’**intégrité**
+
+=== 🔐 JWE – Confidentialité
+
+.Structure
+----
+<HEADER>.<ENCRYPTED_KEY>.<IV>.<CIPHERTEXT>.<TAG>   (JWE)
+
+# En réalité tout est en base64
+Base64URL(HEADER).Base64URL(ENCRYPTED_KEY).Base64URL(IV).Base64URL(CIPHERTEXT).Base64URL(TAG)
+----
+
+Objectif : rendre le **payload illisible** à tout tiers non autorisé.
+Réalisé via **chiffrement symétrique** (ex : AES-256-GCM) avec une **clé CEK** unique par message.
+
+==== 📦 Structure macro d’un JWE compact
+
+[cols="1,3",options="header"]
+|===
+|Segment |Contenu
+
+|`HEADER` |Instructions sur les algorithmes utilisés (`alg`, `enc`, `kid`, etc.)
+|`ENCRYPTED_KEY` |Clé de chiffrement de contenu (CEK) **chiffrée** avec la **clé publique** du destinataire
+|`IV` |Vecteur d’initialisation aléatoire pour AES-GCM
+|`CIPHERTEXT` |Payload JSON chiffrée avec CEK et IV
+|`TAG` |Tag d’authentification assurant l’intégrité du message
+|===
+
+===== 🔣 AAD – Additional Authenticated Data
+
+L’**AAD** est une **donnée d’en-tête** (généralement le `header`) incluse dans le calcul du **tag d’authentification** (Voir section suivante) lors du chiffrement JWE. Cela protège aussi l’en-tête contre toute modification. Très concrètement l'en-tête est ajoutée aux données de calcul du tag. Ainsi, même si le header est en clair, il est protégé contre une modification d'un attaquant. Si le header change, le tag n'est plus valide. Le tag a également pour vocation de protéger contre toute modification des autres parties du JWE.
+
+===== Comprendre l'AAD par un exemple
+
+[source,text]
+----
+AAD = base64url(HEADER)
+
+TAG = Auth( IV, CIPHERTEXT, AAD, CEK )
+----
+
+Le `TAG` est donc un **résumé sécurisé** de :
+- l’IV (vecteur d’initialisation)
+- la payload chiffrée
+- l’entête (AAD)
+- la CEK (clé de chiffrement)
+
+==== ⚙️ Étapes détaillées du processus de chiffrement JWE
+
+===== Génération
+
+. Générer une CEK (**Content Encryption Key**) aléatoire (ex: 256 bits pour AES)
+. Générer un IV (ex: 96 bits pour AES-GCM)
+. Chiffrer la **payload JSON** avec CEK + IV → produit `CIPHERTEXT` + `TAG`
+. Chiffrer la **CEK** avec la **clé publique du destinataire** (`alg`) → `ENCRYPTED_KEY`
+. Construire le `HEADER` avec les métadonnées (`alg`, `enc`, `kid`)
+. Encoder tous les éléments en Base64URL et concaténer
+
+===== 🔐 Étapes de chiffrement JWE (compact, AES-GCM)
+
+[source,text]
+----
+1. Génération aléatoire :
+   - CEK = clé symétrique (ex : 256 bits pour A256GCM)
+   - IV  = vecteur d’initialisation (ex : 96 bits aléatoires)
+
+2. Construction du Header :
+   header = {
+     "alg": "RSA-OAEP",
+     "enc": "A256GCM",
+     "kid": "abc123"
+   }
+
+3. Encodage Base64URL du header :
+   encoded_header = base64url( JSON(header) )
+
+4. AAD (Additional Authenticated Data) :
+   AAD = encoded_header   (non chiffré, mais authentifié)
+
+5. Chiffrement AES-GCM :
+   - Entrée : payload JSON
+   - AES-GCM(key=CEK, iv=IV, aad=AAD) ➜ CIPHERTEXT + TAG
+
+6. Chiffrement de la CEK (clé de session) :
+   - encrypted_key = RSA_encrypt(public_key, CEK)
+
+7. Encodages Base64URL :
+   - encrypted_key_b64  = base64url(encrypted_key)
+   - iv_b64             = base64url(IV)
+   - ciphertext_b64     = base64url(CIPHERTEXT)
+   - tag_b64            = base64url(TAG)
+
+8. Construction finale du JWE compact :
+   JWE = encoded_header + "." +
+         encrypted_key_b64 + "." +
+         iv_b64 + "." +
+         ciphertext_b64 + "." +
+         tag_b64
+----
+
+==== Transmission
+
+Le message chiffré contient :
+
+[source,text]
+----
+Base64URL(HEADER).Base64URL(ENCRYPTED_KEY).Base64URL(IV).Base64URL(CIPHERTEXT).Base64URL(TAG)
+----
+
+==== Déchiffrement
+
+. Lire le `HEADER` pour connaître les algos utilisés
+. Déchiffrer `ENCRYPTED_KEY` avec sa **clé privée** → retrouve la CEK
+. Utiliser CEK + IV pour déchiffrer `CIPHERTEXT`
+. Vérifier `TAG` : si invalide → message rejeté
+
+=== ✅ Vérification du TAG JWE (AES-GCM)
+
+[source,bash]
+----
+# Suppose que $JWE contient le token compact : HEADER.ENCRYPTED_KEY.IV.CIPHERTEXT.TAG
+
+IFS="." read -r header_b64 encrypted_key_b64 iv_b64 ciphertext_b64 tag_b64 <<< "$JWE"
+
+# 1. Décodage des segments en base64url (sans padding)
+b64url_decode() {
+  local input="$1"
+  local rem=$(( ${#input} % 4 ))
+  [[ $rem -eq 2 ]] && input="${input}=="
+  [[ $rem -eq 3 ]] && input="${input}="
+  echo "$input" | tr '_-' '/+' | openssl base64 -d -A
+}
+
+header=$(b64url_decode "$header_b64")
+encrypted_key=$(b64url_decode "$encrypted_key_b64")
+iv=$(b64url_decode "$iv_b64")
+ciphertext=$(b64url_decode "$ciphertext_b64")
+tag=$(b64url_decode "$tag_b64")
+
+# 2. Déchiffrer la CEK avec la clé privée
+# Cela suppose que tu as la clé privée dans private.pem
+CEK=$(echo -n "$encrypted_key" | openssl rsautl -decrypt -inkey private.pem -oaep -raw | xxd -p -c256)
+
+# 3. Rejouer le déchiffrement AES-GCM avec AAD = header_b64
+# Préparer les fichiers
+echo -n "$ciphertext" > ciphertext.bin
+echo -n "$tag" > tag.bin
+echo -n "$iv" > iv.bin
+echo -n "$header_b64" > aad.txt
+
+# Reconstituer payload.json (si le tag est valide)
+openssl enc -d -aes-256-gcm \
+  -K "$CEK" \
+  -iv "$(< iv.bin | xxd -p)" \
+  -in ciphertext.bin \
+  -out payload.json \
+  -nosalt \
+  -p \
+  -aad "$(< aad.txt)" \
+  -tag "$(< tag.bin | xxd -p)"
+
+# Si le TAG est incorrect, openssl retournera une erreur :
+# > bad decrypt
+----
+
+==== Algorithmes JWE (structure hybride)
+
+[cols="1,1,2",options="header"]
+|===
+|Champ |Algorithmes |Usage
+
+|`alg` |RSA-OAEP, ECDH-ES, A256KW, etc. |Chiffre la CEK (asymétrique)
+|`enc` |A128GCM, A256GCM, A128CBC-HS256, etc. |Chiffre la payload avec la CEK (symétrique)
+|===
+
+=== 🛠️ Atelier pratique : générer & vérifier un JWS puis un JWE en *Bash*
+
+.Prérequis (install en 1 min)
+----
+# Linux / macOS
+brew install jq openssl            # ou apt install jq openssl
+npm install -g jose-util           # outil CLI pour JWE (Node ≥ 18)
+----
+
+[source,bash]
+----
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 1) Générer une paire RSA
+openssl genrsa -out private.pem 2048
+openssl rsa -in private.pem -pubout -out public.pem
+
+# 2) Préparer une payload JSON (claims)
+cat > payload.json <<'JSON'
+{
+  "sub": "1234567890",
+  "name": "John Doe",
+  "admin": true,
+  "iat": 1709980000
+}
+JSON
+
+# 3) ---------- JWS (RS256) ----------
+HEADER='{"alg":"RS256","typ":"JWT","kid":"demo1"}'
+
+# Helper pour base64url sans padding
+b64url() { openssl base64 -e -A | tr '+/' '-_' | tr -d '='; }
+
+header_b64=$(printf '%s' "$HEADER" | b64url)
+payload_b64=$(jq -c . < payload.json | b64url)
+unsigned="${header_b64}.${payload_b64}"
+
+signature=$(printf '%s' "$unsigned" \
+           | openssl dgst -sha256 -sign private.pem | b64url)
+
+JWS="${unsigned}.${signature}"
+echo -e "\n🔑 JWS (RS256 signé) :\n${JWS}"
+
+# 4) ---------- JWE (RSA-OAEP / AES-256-GCM) ----------
+#   Chiffre TOUTE la payload – résultat = 5 segments
+jose-util encrypt \
+  --alg RSA-OAEP \
+  --enc A256GCM \
+  --key public.pem \
+  --input payload.json > token.jwe
+
+echo -e "\n🛡️  JWE (chiffré) :\n$(cat token.jwe)"
+
+# 5) Déchiffrer le JWE pour vérif
+echo -e "\n🔎 Déchiffrement JWE ➜ payload :"
+jose-util decrypt --key private.pem --input token.jwe
+----
+
+=== ⚙️ Atelier Bash : focus “payload → ciphertext”
+
+*payload → ciphertext*
+
+[code, bash]
+----
+# (suite du script précédent, juste après génération de payload.json)
+
+echo -e "\n--- STAGE: Payload en clair ---"
+cat payload.json | jq
+
+#  ➜ Chiffrement AES-256-GCM (offline) pour visualiser les éléments
+CEK=$(openssl rand -hex 32)                      # 32 bytes = 256 bits
+IV=$(openssl rand -hex 12)                       # 12 bytes = 96 bits (GCM)
+AAD=$(printf '%s' '{"alg":"dir","enc":"A256GCM"}' | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+
+CIPHERTEXT_TAG=$( \
+  openssl enc -aes-256-gcm -K "$CEK" -iv "$IV" \
+    -in payload.json -out /dev/stdout -a -A \
+    -p -aad "$AAD" )
+
+echo -e "\n--- STAGE: Ciphertext + Tag (local demo) ---"
+echo "$CIPHERTEXT_TAG"
+
+----
+
+.Lecture des résultats
+* **JWS** → 3 segments : `HEADER.PAYLOAD.SIGNATURE`
+*Lisible* via :
+`echo "$JWS" | cut -d'.' -f1-2 | tr '.' '\n' | while read p; do echo "$p" | openssl base64 -d -A | jq; done`
+* **JWE** → 5 segments : `HEADER.ENCRYPTED_KEY.IV.CIPHERTEXT.TAG`
+*Illisible* sans la clé privée. La commande `jose-util decrypt …` affiche la payload initiale.
+
+== Pourquoi ne pas chiffrer la payload directement avec la clé publique ?
+
+=== Limitation des algorithmes asymétriques
+
+- RSA est limité à de **petits messages** (ex: 190 octets max avec RSA-2048)
+- Trop lent pour des payloads volumineuses
+- Pas sécurisé pour du *raw encryption* de données utilisateur
+
+➡️ On préfère **chiffrer une CEK**, puis utiliser cette CEK pour chiffrer la payload.
+
+=== Performance
+
+- AES (symétrique) est :
+* rapide
+* sécurisé
+* accéléré matériellement
+- RSA/ECDH sont **parfaits pour protéger une petite clé** (CEK)
+
+=== Standardisation
+
+- Modèle dit **chiffrement hybride** adopté partout (TLS, Signal, JWE)
+- Séparation claire :
+* asymétrie = protection de la CEK
+* symétrie = protection de la donnée
+
+== Sécurité
+
+=== Durée de vie & renouvellement
+
+* `exp` court : 5 – 30 min
+* **Refresh token** (OAuth2 / OIDC) pour renouveler sans re-login
+* Autoriser la **rotation d’access token** (grâce au `kid` et au JWKS)
+
+=== Vulnérabilités classiques
+* `alg: none`
+* Confusion `RS256` → `HS256`
+* Jeton très long (`exp` éloigné)
+* Stockage dans `localStorage` (XSS)
+
+=== Bonnes pratiques
+* Cookies **HttpOnly + SameSite** pour navigateurs
+* `X-Auth-Token` ou header *Authorization* « Bearer » côté API
+* Activer **CORS** correctement
+* Journaliser `jti`, `sub`, erreurs de validation
+
+== 🔁 Rotation des clés (`kid`, JWKS)
+
+=== Concepts
+
+[cols="1,3"]
+|===
+|`kid` |Identifie la clé de signature dans l’en-tête
+|JWKS  |Endpoint JSON exposant les **clés publiques**
+|Rotation |Remplacement régulier de la clé privée + publication clé publique
+|===
+
+=== Exemple : JWT signé
+
+[source,json]
+----
+{
+  "alg": "RS256",
+  "typ": "JWT",
+  "kid": "abc123"
+}
+----
+
+=== Exemple : JWKS
+
+[source,json]
+----
+{
+  "keys": [
+    { "kid": "abc123", "kty": "RSA", "alg": "RS256", "n": "...", "e": "AQAB" },
+    { "kid": "def456", "kty": "RSA", "alg": "RS256", "n": "...", "e": "AQAB" }
+  ]
+}
+----
+
+=== Flux de vérification
+
+1. Le client lit `kid = abc123` dans le JWT.
+2. Il récupère (ou met à jour) le **JWKS**.
+3. Il extrait la clé publique `abc123`.
+4. Il vérifie la signature.
+
+=== Implémenter un JWKS
+
+* **Clé-en-main** : Keycloak, Auth0, Cognito, Dex
+* **Custom** : exposer `/jwks.json` et signer via libs :
+- Go : `golang-jwt/jwt`, `MicahParks/keyfunc`
+- Node : `jose`, `jsonwebtoken`
+- Java : `Nimbus JOSE + JWT`, Spring Security
+
+=== Gestion des clés privées
+
+* Stockage : Vault, AWS KMS, Azure Key Vault, fichier chiffré
+* Rotation :
+1. Générer nouvelle paire
+2. Publier clé publique (`kid` unique)
+3. Signer les nouveaux tokens
+4. Retirer l’ancienne clé après période de grâce
+
+== Cas d’usage
+
+[cols="2,1,2",options="header"]
+|===
+|Contexte |JWT adapté ? |Notes
+
+|Auth front → API REST |✅ Oui |Stateless, scalable
+|Micro-services internes |✅ Oui* |`RS256` / mTLS / mTLS+JWT
+|Sessions navigateur |⚠️ À nuancer |Préférer cookies HttpOnly
+|gRPC |✅ Oui |Via métadonnées
+|Données sensibles |❌ (JWS) / ✅ (JWE) |Utiliser JWE ou token opaque
+|===
+
+== Alternatives
+
+[cols="1,2",options="header"]
+|===
+|Alternative |Points clés
+
+|Session ID |État serveur, révocation facile
+|Opaque token |Jeton sans info → appel introspection
+|PASETO |JWT like, design « v3 local / v3 public »
+|Macaroon |Jeton délégué, caveats chaînables
+|===
+
+== Implémentations rapides
+
+* **Java / Spring Boot** : `spring-boot-starter-oauth2-resource-server`, `issuer-uri` ⇒ JWKS auto.
+* **Node.js** : `express-jwt` + `jose`, vérification `alg`, `aud`, `iss`.
+* **Go** : `github.com/golang-jwt/jwt/v5`, middleware Gin / Chi / Echo.
+
+== Audit & Observabilité
+
+* Tracer `sub`, `jti`, `iss`, `aud` dans les logs/metrics
+* Propager le JWT dans les spans OpenTelemetry (balisé)
+* Mettre en place alertes sur : échecs de validation, tentatives `alg: none`, expiration systémique.
+
+== À retenir
+
+* **JWS** ⇢ signature pour l’intégrité.
+* **JWE** ⇢ chiffre pour la confidentialité.
+* Toujours choisir un algo **asymétrique** (`RS256`/`ES256`) + **rotation de clés** (`kid`, JWKS).
+* Ne stocke **jamais** de données sensibles en clair dans un JWS.
+* Utilise un **refresh token** (OAuth2/OIDC) pour prolonger la session sans exposer `exp` long.
+* Un JWT mal géré devient vite une **faille de sécurité** : valider, journaliser, faire tourner les clés !
+
+=== ✅ Points pédagogiques illustrés
+
+* **Signature (JWS)** : intégrité & authenticité – la payload reste *en clair*.
+* **Chiffrement (JWE)** : confidentialité – personne ne lit la payload sans la clé privée.
+* **`kid` + JWKS** : ajoute facilement une nouvelle clé → signe → publie → clients vérifient sans downtime.

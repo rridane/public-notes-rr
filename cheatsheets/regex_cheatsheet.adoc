@@ -1,0 +1,66 @@
+:source-highlighter: rouge
+:toc:
+:toc-title: Sommaire
+:toclevels:
+
+= regex
+
+__last update: 12/01/2023__
+
+.caractèreS
+!===
+| **`.`** | N'importe quel caractère
+| **`b[aeiou]r => character set`** | Trouve bar ber bir bor bur
+| **`^ signifie except, b[^eo]r`** | Ne trouve pas ber et bor
+| **`[e-o] => letter range`** | Ne trouve que les letters comprises entre e et o
+| **`[3-6] => number range`** | Ne trouve que les chiffres entre 3 et 6
+!===
+
+.repetitions
+!===
+| **`* => 0 to n be*r`** | match br ber beer
+| **`+ =>  1 to n`** | match ber beer mais pas br
+| **`? => 0 to 1 (optional) colou?r`** | match color et colour
+| **`{n} => nombres d'occurences souhaitées be{2}r`** | match beer mais pas ber ou beeer
+| **`{n,} => au moins n occurences be{3,}`** | match beeer beeeer mais pas beer
+| **`{n1,n2} => entre n1 et n2 occurences be{1,3}`** | match ber, beer, beeer mais pas br ou beeeer
+!===
+
+.Grouping
+!===
+| **`() => grouper (haa)`** | Matchera tous les haa
+| **`\1 => reference le groupe 1 (ha),\1`** | Matche tous les ha,ha
+| **`\1 \2 => referencer les groupes 1 et 2 (ha)-\1,(haa)-\2`** | Matche tous les ha-ha,haa-haa
+| **`(?:) => ne pas referencer le groupe (?:ha)-ha,(haa)-\1`** | Matche tous les ha-ha,haa-haa
+| **`\| => pipe character ou or, contrairement au [] il permets de faire des ou sur des mots (C\|c)at\|rat, [] est utilisé pour un seul caractère`** | selectionne les trois mots cat Cat et rat
+| **`\ => escape, permets de selectionner un des caractères {}[]/\+*.$^ \| ? (\*\|\.)`** | Matche tous les * et tous les .
+| **`^ => beginning line ^[0-9]`** | selectionne tous les chiffres au débuts
+| **`$ => end of line html$`** | selectionne tous les html en fin de ligne
+!===
+
+.les raccourcis
+!===
+| **`\w => lettres, nombres ou underscore \w`** | Match tous les caractères de  abcABC123 _ mais pas .:!?
+| **`\W => lettres, nombres ou underscore \w`** | Ne match pas tous les caractères de abcABC123 _ mais match .:!?
+| **`\d => match tous les nombres \d`** | match tous les caractères de 012345789
+| **`\D => match tous sauf les nombres \D`** | Ne match aucun des caractères de 012345789 mais match adb
+| **`\s => match les espaces \s`** | matche l'espace dans la chaine ABC123 .:!?
+| **`\S => match tout sauf les espaces \S`** | matche tous les caractères sauf l'espace dans la chaine ABC123 .:!?
+!===
+
+.lookaround
+!===
+| **`(?=) => positive lookahead, selectionne le caractère avant quelque chose \d+(?=PM) \d+(?=PM)`** | Selectionne le 3 dans la chaine Date: 4 Aug 3PM
+| **`(?!) => negative lookahead, selectionne le caractère avant autre chose que le quelque chose \d+(?!PM)`** | selectionne le 4 dans Date: 4 Aug 3PM, car c'est le seul chiffre qui n'a pas PM après
+| **`(?<=)  => positive lookbehind, selectionne le caractère après quelque chose (?<=\$)\d+`** | selectionne le 5 dans Product Code: 1064 Price: $5
+| **`(?<!) => negative lookbehind, selectionne le caractère après autre chose que quelque chose (?<!\$)\d+`** | selectionne les chiffres qui avant eux n'ont pas $
+!===
+
+.flags
+!===
+| **`g => global modifie, selectionne toutes les occurences`** |
+| **`mg => multiline flag, regarde toutes les lignes`** |
+| **`isensitive => désactive le key sensitive`** |
+| **`greedy matching, ne s'arrête pas à la première occurence`** | mode par défaut
+| **`lazy matching .*?r`** | selectionne uniquement ber dans ber beer beeer
+!===
